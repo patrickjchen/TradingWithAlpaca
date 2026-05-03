@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
@@ -8,15 +8,15 @@ from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
 def _to_dict(obj: Any) -> Any:
     """
-    Serialize SDK responses to plain Python dicts/lists.
-    Prefers model_dump(mode='json') for Pydantic v2, falls back to dict() or __dict__.
+    Serialize SDK responses to dictionaries.
+    Prefers model_dump(mode='json') to handle UUIDs/datetimes safely.
     """
     if obj is None:
         return None
     if isinstance(obj, list):
         return [_to_dict(item) for item in obj]
     if hasattr(obj, "model_dump"):
-        return obj.model_dump(mode="json")
+        return obj.model_dump(mode='json')
     if hasattr(obj, "dict"):
         return obj.dict()
     if hasattr(obj, "__dict__"):
@@ -26,7 +26,7 @@ def _to_dict(obj: Any) -> Any:
 
 def get_client(live: bool = False) -> TradingClient:
     """
-    Factory to create an Alpaca TradingClient.
+    Factory to create and return an Alpaca TradingClient.
     Defaults to paper trading unless live=True.
     """
     key = os.environ["ALPACA_API_KEY_ID"]
@@ -55,14 +55,14 @@ def orders(live: bool = False, status: str = 'open', limit: int = 50) -> list[di
         'closed': QueryOrderStatus.CLOSED,
         'all': QueryOrderStatus.ALL
     }
-    query_status = status_map.get(status.lower(), QueryOrderStatus.OPEN)
+    req_status = status_map.get(status.lower(), QueryOrderStatus.OPEN)
+    req = GetOrdersRequest(status=req_status, limit=limit)
     
-    req = GetOrdersRequest(status=query_status, limit=limit)
     return _to_dict(client.get_orders(filter=req))
 
 
 def buy_market(symbol: str, qty: float, live: bool = False) -> dict:
-    """Submit a market buy order for a crypto symbol."""
+    """Submit a market buy order."""
     client = get_client(live)
     req = MarketOrderRequest(
         symbol=symbol,
@@ -74,7 +74,7 @@ def buy_market(symbol: str, qty: float, live: bool = False) -> dict:
 
 
 def sell_market(symbol: str, qty: float, live: bool = False) -> dict:
-    """Submit a market sell order for a crypto symbol."""
+    """Submit a market sell order."""
     client = get_client(live)
     req = MarketOrderRequest(
         symbol=symbol,
@@ -86,7 +86,7 @@ def sell_market(symbol: str, qty: float, live: bool = False) -> dict:
 
 
 def buy_limit(symbol: str, qty: float, limit_price: float, live: bool = False) -> dict:
-    """Submit a limit buy order for a crypto symbol."""
+    """Submit a limit buy order."""
     client = get_client(live)
     req = LimitOrderRequest(
         symbol=symbol,
@@ -99,7 +99,7 @@ def buy_limit(symbol: str, qty: float, limit_price: float, live: bool = False) -
 
 
 def sell_limit(symbol: str, qty: float, limit_price: float, live: bool = False) -> dict:
-    """Submit a limit sell order for a crypto symbol."""
+    """Submit a limit sell order."""
     client = get_client(live)
     req = LimitOrderRequest(
         symbol=symbol,

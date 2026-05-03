@@ -107,9 +107,10 @@ def gemini_llm_config(temperature: float | None = 0.2) -> dict:
             "api_key": load_openrouter_key(),
             "base_url": OPENROUTER_BASE,
             "api_type": "openai",
-            # OpenRouter default for Gemini 2.5 Flash truncated the brief at
-            # ~400 chars; give the agents room to finish two full files.
-            "max_tokens": 8192,
+            # webgui.py is a Flask app with an inline HTML/CSS/JS template
+            # and easily exceeds 8192 output tokens; truncated output has no
+            # closing ``` fence and fails extract_block. Give plenty of room.
+            "max_tokens": 32768,
         }],
     }
     if temperature is not None:
@@ -129,14 +130,19 @@ LLM coder will use as a spec. Two top-level sections:
 
   - The websocket URL for crypto market data (paper/live distinction, if any).
   - How auth is performed (the auth message shape with key/secret).
-  - The subscribe message shape -- specifically how to subscribe to trades
-    and quotes for a list of symbols (e.g. `BTC/USD`). DO NOT cover bars --
-    we are intentionally NOT subscribing to bars.
+  - The subscribe message shape -- specifically how to subscribe to trades,
+    quotes, AND L2 orderbooks for a list of symbols (e.g. `BTC/USD`). DO NOT
+    cover bars -- we are intentionally NOT subscribing to bars.
   - The shape (field names + types) of the messages the server pushes for
-    trades (`t`) and quotes (`q`). Include the symbol field name. Skip bars.
+    trades (`t`), quotes (`q`), and orderbooks (`o`). Include the symbol
+    field name. For orderbooks, document that each message is a SNAPSHOT
+    (the full book on each tick, not a delta) with `bids` and `asks` arrays
+    of `{price, size}` levels. Skip bars.
   - The recommended Python SDK (`alpaca-py`) classes that wrap this:
     `CryptoDataStream` -- constructor args, `subscribe_trades` /
-    `subscribe_quotes`, async handler signatures, `run()`.
+    `subscribe_quotes` / `subscribe_orderbooks`, async handler signatures
+    (note the Orderbook model's `.bids` / `.asks` are lists of items with
+    `.price` / `.size` attributes), `run()`.
 
 ## Part B -- Alpaca Trading REST API
 
@@ -167,11 +173,13 @@ CODER_PREAMBLE = """You are a senior Python engineer. You will be given:
       -- do NOT modify them; just use their public surface,
   (4) optionally, compile/runtime errors from a previous attempt.
 
-Output format: emit EXACTLY ONE fenced ```python``` block containing the
-full source of the requested file. No prose, no FILE markers, no extra
-fenced blocks. Use only the stdlib plus `alpaca-py`, `redis`. Type-hint
-where useful but don't over-engineer. Both `python -m py_compile` and
-`import <module>` must succeed.
+Output format: emit EXACTLY ONE fenced code block containing the full
+source of the requested file. The block's language tag (```python or
+```html) is specified per stage. No prose, no FILE markers, no extra
+fenced blocks. For Python files, use only the stdlib plus `alpaca-py`,
+`redis`, `flask`. Type-hint where useful but don't over-engineer. Both
+`python -m py_compile` and `import <module>` must succeed for Python
+artifacts.
 
 Durable rules (do NOT regress between iterations):
   - alpaca-py async/sync (subscriber):
@@ -182,6 +190,7 @@ Durable rules (do NOT regress between iterations):
                 ...
                 stream.subscribe_trades(trade_handler, *symbols)
                 stream.subscribe_quotes(quote_handler, *symbols)
+                stream.subscribe_orderbooks(orderbook_handler, *symbols)
                 try:
                     await stream._run_forever()   # the async coroutine
                 finally:
@@ -194,6 +203,26 @@ Durable rules (do NOT regress between iterations):
     The `Bar` model lacks an `exchange` attribute -- but we don't handle bars.
   - We are NOT handling bars. No `subscribe_bars`, no `bar_handler`. Do not
     add bars even if the brief mentions them.
+  - L2 orderbooks: alpaca-py's `CryptoDataStream.subscribe_orderbooks(handler,
+    *symbols)` delivers an `Orderbook` model with attrs `symbol`, `timestamp`,
+    `bids`, `asks`. Each side is a LIST of items with `.price` and `.size`
+    (NOT dicts and NOT keyed by exchange). Despite Alpaca's docs claiming
+    snapshots, the websocket actually delivers DELTAS -- each message contains
+    only the levels that changed. The subscriber MUST merge these into
+    accumulated state, NEVER overwrite the whole book. Use per-side Redis
+    HASHes keyed by price for an idempotent merge:
+        for level in book.bids:                       # repeat for asks
+            field = format_price(level.price)         # canonical str, e.g. f"{p:.10g}"
+            if level.size > 0:
+                r.hset(f"alpaca:ob:bids:{symbol}", field, level.size)
+            else:
+                r.hdel(f"alpaca:ob:bids:{symbol}", field)
+    A level with `size == 0` (or a level NOT present in a follow-up message
+    while previously present) means "remove this price level". Format the
+    price field consistently across writes so updates land on the same hash
+    field instead of accumulating duplicates. Also write a small metadata
+    HASH `alpaca:orderbook:<SYM>` with `symbol` + `timestamp` so consumers
+    can show last-update info.
   - Redis HSET cannot accept `None` values. Crypto quotes routinely have
     `bid_exchange`/`ask_exchange` = None. Before every `r.hset(..., mapping=d)`
     call, filter Nones with a `_clean(d)` helper:
@@ -211,17 +240,56 @@ REQUIREMENTS:
     a helpful message if missing.
   - Connect to Redis via `redis.Redis.from_url(os.environ.get("REDIS_URL",
     "redis://localhost:6379/0"), decode_responses=True)`.
-  - Subscribe to **trades and quotes only** (NOT bars) for the symbols passed
-    on the command line (default to the SYMBOLS constant if none given).
-  - For each incoming message, write to Redis (apply `_clean(d)` first):
+  - Subscribe to **trades, quotes, AND orderbooks** (NOT bars) for the
+    symbols passed on the command line (default to the SYMBOLS constant if
+    none given).
+  - For each incoming TRADE or QUOTE message, write to Redis (apply
+    `_clean(d)` first):
       * `HSET alpaca:latest:<SYMBOL> <field> <value>` -- merge latest fields
-        across trades/quotes (price, bid, ask, ts, ...).
+        across trades/quotes (price, bid_price, bid_size, ask_price, ask_size,
+        timestamp, ...). Field names: `price` (last trade), `bid_price`,
+        `bid_size`, `ask_price`, `ask_size`, `timestamp`.
       * `LPUSH alpaca:recent:<SYMBOL>:<KIND> <json>` then `LTRIM ... 0 99`
         where KIND is `trade` or `quote`.
-      * `SADD alpaca:symbols <SYMBOL>` so the CLI can list them.
+      * `SADD alpaca:symbols <SYMBOL>` so the CLI / GUI can list them.
+  - For each incoming ORDERBOOK message, MERGE the levels into per-side
+    Redis HASH keys (one HASH per side per symbol). Alpaca's crypto
+    orderbook websocket delivers DELTAS -- each message has only the
+    changed levels, NOT a full snapshot. Overwriting the whole book on
+    each tick (the obvious wrong implementation) would leave you with
+    just the last delta in Redis. Apply per-level updates instead:
+        BIDS_KEY = f"alpaca:ob:bids:{symbol}"
+        ASKS_KEY = f"alpaca:ob:asks:{symbol}"
+        def _pf(p): return f"{float(p):.10g}"  # canonical price field name
+
+        # for each level in the incoming book.bids:
+        for lv in book.bids:
+            field = _pf(lv.price)
+            size  = float(lv.size)
+            if size > 0:
+                r.hset(BIDS_KEY, field, size)
+            else:
+                r.hdel(BIDS_KEY, field)
+        # ... and the same for book.asks against ASKS_KEY.
+
+    After applying the deltas, write a small metadata HASH for the GUI:
+        r.hset(f"alpaca:orderbook:{symbol}", mapping={
+            "symbol":    symbol,
+            "timestamp": iso_ts_string,
+        })
+        r.sadd("alpaca:symbols", symbol)
+    DO NOT json-encode bids/asks into the metadata hash; the actual book
+    levels live ONLY in the per-side HASHes. DO NOT clear the per-side
+    HASHes before writing -- that defeats the merge.
+
+    Note: alpaca-py's Orderbook model carries `.bids` and `.asks` as
+    LISTS of items with `.price` and `.size` ATTRIBUTES (not dicts).
+    Read them via `lv.price`, `lv.size`.
   - Convert datetimes to ISO strings before storing. Use `default=str` in
     json.dumps for safety.
-  - Async handlers; follow the exact main() pattern in the durable rules.
+  - Async handlers (one each for trade / quote / orderbook); follow the exact
+    main() pattern in the durable rules (subscribe_trades + subscribe_quotes
+    + subscribe_orderbooks, then `await stream._run_forever()`).
   - Handle KeyboardInterrupt cleanly."""
 
 TRADER_SYS = CODER_PREAMBLE + """
@@ -485,18 +553,32 @@ WEBGUI_SYS = CODER_PREAMBLE + """
 
 You are generating: webgui.py
 
-Long-running Flask web UI for monitoring market data, recent orders/fills,
-and submitting paper trades. Reads real-time bid/ask from Redis (the same
-keys subscriber.py writes), reads order/fill history from SQLite (the same
-schema persister.py writes), and proxies order placement through trader.py.
-You will receive subscriber.py, trader.py, and persister.py as context --
-do NOT redefine them; use their public surface and key/schema conventions.
+Thin Flask BACKEND for the trading UI. ALL HTML/CSS/JS lives in a separate
+file (`generated/web/index.html`) generated by a different stage; this
+file MUST NOT contain any inline HTML template -- no `render_template_string`,
+no embedded `<html>` strings. Serve `web/index.html` as a static file.
+The backend's job: serve that static page + expose JSON endpoints over
+Redis / SQLite / trader.
+
+You will receive subscriber.py, trader.py, persister.py, and
+web/index.html as context -- do NOT redefine them; just use their public
+surface, the Redis key conventions, the SQLite schema, and the endpoint
+shapes the HTML's JS calls.
 
 REQUIREMENTS:
-  - Use Flask. Module-level work is allowed (`app = Flask(__name__)`,
-    route decorators) but do NOT call `app.run()` at import time -- only
-    inside `if __name__ == "__main__":` so the verifier (which imports
-    the module) doesn't bind a port.
+  - Use Flask. Module-level work allowed (`app = Flask(__name__,
+    static_folder=str(WEB_DIR), static_url_path='/static')`, route
+    decorators) but do NOT call `app.run()` at import time -- only inside
+    `if __name__ == "__main__":` so the verifier (which imports the
+    module) doesn't bind a port.
+  - Locate the web dir relative to THIS file:
+        from pathlib import Path
+        WEB_DIR = Path(__file__).parent / "web"
+  - `GET /` returns `send_from_directory(str(WEB_DIR), "index.html")`.
+    If `web/index.html` is missing, return a 200 with a small inline
+    string saying "web/index.html not generated yet -- run `python
+    alpaca_codegen.py --stage webgui_html`" so the operator gets a clear
+    message instead of a 404.
   - Read REDIS_URL the same way subscriber.py does
     (`os.environ.get("REDIS_URL", "redis://localhost:6379/0")`,
     `decode_responses=True`).
@@ -505,134 +587,303 @@ REQUIREMENTS:
   - Import trader as `import trader` (same directory) for order placement.
   - Default bind: host=os.environ.get("WEBGUI_HOST", "127.0.0.1"),
     port=int(os.environ.get("WEBGUI_PORT", "5000")). Print the URL on
-    startup. `debug=False`.
+    startup. `debug=False`, `threaded=True`.
+  - Silence Werkzeug's per-request access log (the Escalator polls
+    /api/orderbook every 1s -- that's 60 lines/min of noise per browser
+    tab):
+        logging.getLogger('werkzeug').setLevel(logging.WARNING)
+    Replace it with a throttled summary: an `@app.after_request` hook
+    that counts requests by path under a `threading.Lock`, and once
+    every 60 seconds prints ONE line:
+        f"[webgui] {total} requests in last 60s ({top_paths_with_counts})"
+    Then resets the counter. Use `time.monotonic()` for the interval
+    timer. The summary print should `flush=True` so it appears promptly.
 
-  THREE TABS in a single HTML page (use `render_template_string` with one
-  inline template). Tabs are switched client-side via plain JS; do NOT
-  create separate routes per tab. Vanilla JS only -- no React/Vue/jQuery.
-  Minimal inline CSS. Use fetch() + setInterval for polling.
+  JSON API endpoints (each returns JSON via flask.jsonify). ALL DATA FOR
+  THE LADDER COMES FROM REDIS -- never call Alpaca for market data here.
 
-  Tab 1: "Escalator" -- real-time bid/ask board.
-    - Table with columns: symbol, bid_price, bid_size, ask_price, ask_size,
-      last price, timestamp. Field names match subscriber.py's HSET payload
-      exactly: `bid_price`, `bid_size`, `ask_price`, `ask_size`, `price`
-      (last trade), `timestamp`. Some fields may be absent for a symbol
-      that has only had trades-or-only-quotes -- render empty cell, not
-      "undefined".
-    - Row population: GET /api/latest_all every 1000ms, replace table body.
-    - Each row is clickable. Clicking opens a modal dialog (an absolutely
-      positioned `<div>` toggled via JS -- no `<dialog>` element, for
-      browser compatibility) with these inputs:
-        * Symbol: dropdown populated from /api/symbols, pre-selected to
-          the clicked row's symbol.
-        * Side: buy / sell radio buttons.
-        * Type: market / limit radio. If "limit" is chosen, reveal a
-          limit-price number input.
-        * Qty: number input, step="any" (fractional ok).
-        * Live: checkbox, default OFF. When checked, show a JS confirm()
-          "This will place a REAL order. Continue?" before submitting.
-        * Submit: POSTs JSON to /api/order. Show the JSON response (or
-          error) inside the dialog; do not auto-close on success so the
-          user can read the order id.
-        * Close (X) button.
+    GET  /api/symbols
+        -> sorted list from SMEMBERS alpaca:symbols. Empty list (not 500)
+           if the set is missing.
 
-  Tab 2: "Orders & Fills" -- recent activity from SQLite.
-    - Two tables stacked vertically. Manual Refresh button at the top of
-      the tab; no auto-poll (this changes slowly).
-    - Orders table (most-recent 50): columns order_id (truncate to 8
-      chars), symbol, side, type, qty, filled_qty, status, submitted_at.
-      Source: GET /api/orders?limit=50.
-    - Fills table (most-recent 50): columns ts, order_id (truncate to 8),
-      symbol, side, qty, price, event. Source: GET /api/fills?limit=50.
+    GET  /api/orderbook/<path:symbol>
+        -> Build a top-N-levels snapshot for ONE symbol strictly from
+           Redis. The book is stored as TWO per-side HASHes maintained by
+           subscriber.py via merge-of-deltas:
+               alpaca:ob:bids:<SYM>   field = price (str)  value = size (str)
+               alpaca:ob:asks:<SYM>   field = price (str)  value = size (str)
+           Resolution order:
+             1. HGETALL alpaca:ob:bids:<SYM> + HGETALL alpaca:ob:asks:<SYM>.
+                If EITHER side has at least one entry, build:
+                  bids = [{"price": float(p), "size": float(s)}
+                          for p, s in bid_hash.items() if float(s) > 0]
+                  bids.sort(key=lambda x: -x["price"])     # best (highest) first
+                  asks = [...]
+                  asks.sort(key=lambda x:  x["price"])     # best (lowest)  first
+                Return {"symbol": <SYM>,
+                        "timestamp": HGET alpaca:orderbook:<SYM> timestamp,
+                        "bids": bids[:10], "asks": asks[:10]}.
+             2. Else fallback to HGETALL alpaca:latest:<SYM> and synthesize
+                a 1-level book from `bid_price`/`bid_size`/`ask_price`/
+                `ask_size`. Include `"fallback": "quote_only"`.
+             3. Else return {"symbol": <SYM>, "bids": [], "asks": [],
+                "fallback": "no_data"} -- NEVER 500.
+           Coerce numeric fields to floats. Skip any field whose value
+           parses to 0 or non-numeric. Do NOT read the metadata HASH's
+           `bids`/`asks` keys -- they aren't there in the new schema.
 
-  Tab 3: "Summary" -- account + positions + PnL.
-    - Live toggle (checkbox, default OFF=paper). Manual Refresh button.
-    - Account snapshot: equity, cash, buying_power, portfolio_value (read
-      from trader.account(live)'s dict; some keys may be strings from
-      model_dump -- coerce to float for display when possible).
-    - Positions table: symbol, qty, avg_entry_price, current_price,
-      market_value, unrealized_pl, unrealized_plpc (from
-      trader.positions(live)).
-    - "Realized PnL by symbol" table: aggregated from the SQLite `fills`
-      table. Per-symbol sum of `(price * qty) * (+1 if side=='sell'
-      else -1)`. This is a rough proxy, not GAAP.
-    - All three blocks come from a single GET /api/summary?live=0|1
-      response so the page can refresh atomically.
+    GET  /api/latest/<path:symbol>
+        -> HGETALL alpaca:latest:<SYM>. {} if absent.
 
-  JSON API endpoints (each returns JSON; use jsonify):
-    GET  /api/symbols          -> sorted list from SMEMBERS alpaca:symbols.
-                                   Empty list (not 500) if the set is missing.
-    GET  /api/latest_all       -> {symbol: HGETALL alpaca:latest:<SYM>} for
-                                   every symbol in alpaca:symbols. Empty
-                                   dict if no symbols yet.
-    GET  /api/latest/<symbol>  -> HGETALL alpaca:latest:<SYM>. {} if absent.
-    GET  /api/orders?limit=50  -> rows from SQLite orders ORDER BY
-                                   submitted_at DESC LIMIT ?. [] if the db
-                                   file or table is missing.
-    GET  /api/fills?limit=50   -> rows from SQLite fills ORDER BY ts DESC
-                                   LIMIT ?. [] if missing.
-    GET  /api/summary?live=0   -> {"account": {...}, "positions": [...],
-                                   "realized_pnl_by_symbol": {SYM: float}}.
-                                   `live` query arg "1"/"true" enables live;
-                                   anything else is paper.
-    POST /api/order            -> JSON body:
-                                   {"symbol": str, "qty": float,
-                                    "side": "buy"|"sell",
-                                    "type": "market"|"limit",
-                                    "limit_price": float (required if type=limit),
-                                    "live": bool (default false)}
-                                   Validate side, type, required fields.
-                                   On bad input return ({"error": "..."},
-                                   400). Otherwise dispatch to
-                                   trader.buy_market / trader.sell_market /
-                                   trader.buy_limit / trader.sell_limit and
-                                   return its result dict.
+    GET  /api/orders?limit=50&status=...
+        -> rows from SQLite orders ORDER BY submitted_at DESC LIMIT ?.
+           [] if the db file or table is missing.
+
+    GET  /api/fills?limit=50
+        -> rows from SQLite fills ORDER BY ts DESC LIMIT ?. [] if missing.
+
+    GET  /api/summary?live=0
+        -> {"account": {...}, "positions": [...],
+            "realized_pnl_by_symbol": {SYM: float}}.
+           account + positions come from trader.account(live) /
+           trader.positions(live). realized_pnl is aggregated from the
+           SQLite fills table: per-symbol sum of `(price*qty) * (+1 if
+           side=='sell' else -1)`. `live` query arg in {"1","true","yes"}
+           enables live; anything else is paper. If creds / DB missing,
+           return whatever blocks succeeded and `null` for the rest --
+           never 500.
+
+    POST /api/order
+        -> JSON body:
+            {"symbol": str, "qty": float, "side": "buy"|"sell",
+             "type": "market"|"limit",
+             "limit_price": float (required if type=="limit"),
+             "live": bool (default false)}
+           Validate side, type, required fields. On bad input return
+           ({"error": "..."}, 400). Otherwise dispatch to
+           trader.buy_market / trader.sell_market / trader.buy_limit /
+           trader.sell_limit and return its result dict. On trader
+           exception, return ({"error": str(e), "type":
+           e.__class__.__name__}, 400).
+
+    DELETE /api/order/<order_id>
+        -> trader.cancel(order_id, live=...). `live` from `?live=1` query
+           arg. Return {"cancelled": <id>} on success, ({"error":...},
+           400) on failure.
 
   - SQLite reads: open a fresh connection per request
-    (`sqlite3.connect(db_path, check_same_thread=False)`). Wrap each query
-    in `try/except sqlite3.OperationalError` (tables may not exist before
-    persister.py first runs) and return [] on that error. Use
+    (`sqlite3.connect(db_path, check_same_thread=False)`). Wrap each
+    query in `try/except sqlite3.OperationalError` (tables may not exist
+    before persister.py first runs) and return [] on that error. Use
     `conn.row_factory = sqlite3.Row` and convert rows to dicts so the
     JSON response has named fields.
-  - Defensive rendering: Escalator must not 500 when Redis is empty.
-    /api/orders /api/fills must not 500 when alpaca.db is missing.
+  - Defensive rendering: NO endpoint may 500 on missing data -- empty
+    Redis returns []/{}; missing alpaca.db returns []; missing creds in
+    /api/summary returns null/empty blocks.
   - The trader module reads ALPACA_API_KEY_ID/SECRET only inside
     get_client(); routes that DON'T need trading (everything except
-    /api/order and /api/summary) MUST NOT call any trader.* function, so
-    the page renders even without Alpaca creds set.
+    /api/order, /api/order/<id> DELETE, and /api/summary) MUST NOT call
+    any trader.* function, so the page renders even without Alpaca creds.
   - Handle KeyboardInterrupt cleanly. Module imports must NOT touch the
-    network."""
+    network. Keep the file SHORT -- no inline templates, no fancy
+    helpers. Aim well under 300 lines."""
+
+INDEX_HTML_SYS = """You are a senior frontend engineer. Generate a SINGLE
+self-contained HTML page (no build step, no external JS/CSS dependencies)
+that drives the Alpaca crypto trading UI by calling the JSON endpoints
+exposed by `webgui.py`.
+
+Output format: emit EXACTLY ONE fenced ```html``` block containing the
+complete HTML document. No prose, no FILE markers, no extra fenced blocks.
+The first line of the block must be `<!DOCTYPE html>`.
+
+Constraints:
+  - Vanilla JS only -- no React/Vue/jQuery/imports/CDN <script src=...>.
+  - Inline `<style>` and inline `<script>`. One file, no externals.
+  - Use `fetch()` for REST and `setInterval()` for polling. (No SSE -- the
+    backend is REST-only.)
+  - Pages MUST work even if Redis is empty / SQLite is missing. Show
+    placeholders ("(no data)" / "(no symbols streaming)") rather than
+    blowing up on null/empty responses.
+
+LAYOUT:
+  - A small header strip with the page title and a Refresh button.
+    The Symbol selector is NOT global -- it lives inside the Escalator
+    tab (it is meaningful only there).
+  - Three TABS, switched client-side via plain JS:
+
+  Tab 1: "Escalator" -- per-symbol depth ladder.
+    THE ESCALATOR'S DATA SOURCE IS REDIS (read by webgui.py, served via
+    /api/orderbook/<symbol>). The page itself never talks to Alpaca.
+    - The TAB ITSELF owns a Symbol <select> at its top (populated from
+      /api/symbols). The selector must not appear in the page header --
+      only the Escalator tab uses it.
+    - One ladder for the symbol CURRENTLY SELECTED in this tab's
+      dropdown. Switching the dropdown re-renders the ladder.
+    - The ladder is a single table with EXACTLY 21 rows:
+        * 10 ASK rows on top, ordered HIGHEST price at the very top down
+          to BEST (lowest) ask just above the spread divider.
+        * 1 spread divider row in the middle, showing
+          "spread <px>  (<bps> bps)" computed from the best bid/ask.
+        * 10 BID rows below, ordered BEST (highest) bid just under the
+          divider down to lowest at the bottom.
+      ONE PRICE PER ROW. Columns per row: side label, price, size.
+    - If fewer than 10 distinct levels exist on a side, PAD the missing
+      slots with EMPTY rows so the ladder is always 21 rows tall. Do
+      NOT render literal "undefined" or "null" in any cell -- render an
+      empty string instead.
+    - Visually distinguish ask rows (red-tinted text + hover) from bid
+      rows (green-tinted text + hover).
+    - Click handlers:
+        * Clicking an ASK row opens the order modal as a BUY at that
+          row's price (the user is lifting the offer).
+        * Clicking a BID row opens the order modal as a SELL at that
+          row's price (the user is hitting the bid).
+        * Empty rows are not clickable.
+    - Polling: GET /api/orderbook/<currentSymbol> every 1000ms; replace
+      the table body in place.
+    - Below the ladder, show a small meta line: symbol, timestamp, and
+      any `fallback` field present in the response (e.g. "[quote_only]"
+      or "[no_data]") so the operator can see the data source.
+
+  Tab 2: "Activity" -- recent orders + fills from SQLite.
+    - Manual Refresh button + a Status filter <select> (all / open /
+      filled / canceled). No auto-poll (this changes slowly).
+    - Orders table: GET /api/orders?limit=50[&status=...]. Columns:
+      submitted_at, symbol, side, type, qty, filled_qty, status,
+      order_id (truncate to 8 chars; full id in `title` attribute).
+      For active statuses (new/accepted/pending_new/partially_filled),
+      include a "cancel" button that DELETEs /api/order/<id>.
+    - Fills table below it: GET /api/fills?limit=50. Columns: ts,
+      order_id (truncated), symbol, side, qty, price, event.
+
+  Tab 3: "Summary" -- account + positions + realized PnL.
+    - Live toggle (checkbox, default OFF=paper). Manual Refresh button.
+    - One GET /api/summary?live=0|1 returns {account, positions,
+      realized_pnl_by_symbol}. Render:
+        * Account block: equity, cash, buying_power, portfolio_value
+          (key/value grid; coerce numeric strings to floats for display
+          when possible).
+        * Positions table: symbol, qty, avg_entry_price, current_price,
+          market_value, unrealized_pl, unrealized_plpc.
+        * Realized PnL table: per-symbol realized $; bottom row total.
+
+ORDER MODAL (used by Tab 1 row clicks):
+  - Implemented as an absolutely-positioned `<div>` toggled via JS --
+    NOT the native `<dialog>` element (browser compat).
+  - Inputs:
+      * Symbol (readonly, from the row's symbol).
+      * Side  (readonly, "buy" for ask-row click / "sell" for bid-row).
+      * Type  (radio: market / limit; default "limit"). When "limit",
+        a Limit price input is shown, pre-filled with the clicked row's
+        price.
+      * Qty   (number, step="any", required, > 0).
+      * Live  (checkbox, default OFF). When checked, before submit show
+        a JS confirm() "This will place a REAL order. Continue?".
+      * Submit + Close buttons. Esc closes the modal. Enter submits.
+  - On submit: POST JSON to /api/order with {symbol, qty, side, type,
+    limit_price (only if type==limit), live}. Show the response
+    (success or error) as a small toast in the corner; close the modal
+    on success.
+
+API CONTRACT (match the keys webgui.py emits):
+  - GET  /api/symbols                -> string[] (sorted symbols)
+  - GET  /api/orderbook/<symbol>     -> {symbol, timestamp?, bids:[{price,size}],
+                                          asks:[{price,size}], fallback?}
+  - GET  /api/orders?limit=N[&status=S]
+                                     -> object[] (rows from SQLite orders)
+  - GET  /api/fills?limit=N          -> object[] (rows from SQLite fills)
+  - GET  /api/summary?live=0|1       -> {account, positions, realized_pnl_by_symbol}
+  - POST /api/order  body={symbol,qty,side,type,limit_price?,live}
+                                     -> order dict on 200, {error,...} on 400
+  - DELETE /api/order/<order_id>?live=0|1
+                                     -> {cancelled} on 200, {error} on 400
+
+  Defensive behavior: `/api/orderbook/<sym>` may return {bids:[],asks:[],
+  fallback:"no_data"} -- the ladder must still render 21 padded rows.
+  `/api/orders` and `/api/fills` may return [] -- show "(no rows)".
+
+Keep the file under ~550 lines total. No emojis."""
 
 
-# Stage registry: ordered tuples of (target_filename, system_prompt, prior_files_to_pass).
-# Prior files are read from OUT_DIR and given to the Coder as `### EXISTING:` context.
+# Stage registry: ordered tuples of (stage_name, target_path, lang,
+# system_prompt, prior_files_to_pass).
+#   stage_name: short id used by --stage and STAGE_BY_NAME (e.g. "webgui_html").
+#   target_path: path RELATIVE to OUT_DIR (e.g. "web/index.html").
+#   lang:        fenced-block language tag the LLM must emit ("python"|"html").
+# Prior files are read from OUT_DIR and given to the Coder as `### EXISTING:`
+# context. Their language is inferred from extension (.py -> python, .html ->
+# html) so the Coder sees the right code-fence on each.
 STAGES = [
-    ("subscriber.py",   SUBSCRIBER_SYS,   []),
-    ("trader.py",       TRADER_SYS,       []),
-    ("cli.py",          CLI_SYS,          ["subscriber.py", "trader.py"]),
+    ("subscriber",   "subscriber.py",     "python", SUBSCRIBER_SYS,   []),
+    ("trader",       "trader.py",         "python", TRADER_SYS,       []),
+    ("cli",          "cli.py",            "python", CLI_SYS,
+        ["subscriber.py", "trader.py"]),
     # trade_stream: subscribes to Alpaca TradingStream and publishes events
     # into a Redis Stream `alpaca:trade_updates`. trader.py is provided so
     # the LLM can crib the _to_dict serialization helper.
-    ("trade_stream.py", TRADE_STREAM_SYS, ["trader.py"]),
+    ("trade_stream", "trade_stream.py",   "python", TRADE_STREAM_SYS, ["trader.py"]),
     # persister: reads from the Redis Stream and writes to SQLite. No
     # websocket. trade_stream.py is provided so the LLM knows the exact
     # shape of the JSON payloads it will be parsing.
-    ("persister.py",    PERSISTER_SYS,    ["trade_stream.py"]),
-    # webgui: Flask UI tying everything together. Reads Redis via
-    # subscriber's keys, SQLite via persister's schema, places orders via
-    # trader. All three priors are passed so the LLM has the exact field
-    # names / table columns / function signatures.
-    ("webgui.py",       WEBGUI_SYS,       ["subscriber.py", "trader.py", "persister.py"]),
+    ("persister",    "persister.py",      "python", PERSISTER_SYS,    ["trade_stream.py"]),
+    # webgui_html: standalone HTML/CSS/JS frontend. Self-contained -- it
+    # talks to webgui.py over JSON only, so it doesn't need any Python prior.
+    # Generated BEFORE webgui.py so the backend can be told exactly which
+    # endpoints the frontend calls.
+    ("webgui_html",  "web/index.html",    "html",   INDEX_HTML_SYS,   []),
+    # webgui: thin Flask backend. Serves web/index.html as a static file +
+    # exposes JSON endpoints. Reads Redis (subscriber's keys), SQLite
+    # (persister's schema), places orders via trader. All four priors are
+    # passed so the LLM matches field names / table columns / function
+    # signatures / API contract exactly.
+    ("webgui",       "webgui.py",         "python", WEBGUI_SYS,
+        ["subscriber.py", "trader.py", "persister.py", "web/index.html"]),
 ]
-STAGE_BY_NAME = {f[: -len(".py")]: i for i, (f, _, _) in enumerate(STAGES)}
+STAGE_BY_NAME = {name: i for i, (name, _, _, _, _) in enumerate(STAGES)}
 
 
 # ---------- Helpers ----------
 
 def extract_block(text: str, lang: str) -> str | None:
-    # Greedy on the closing fence: the brief contains nested ```json/python```
-    # examples, and a non-greedy match would stop at the first inner fence.
-    m = re.search(rf"```{lang}\s*\n(.*)\n```", text, re.DOTALL)
+    """Pull a fenced code block out of the LLM's response.
+
+    Tried in order:
+      1. ```<lang>\\n...\\n```            (the canonical case; case-insensitive
+                                            on the lang tag because Gemini
+                                            sometimes emits ```HTML).
+      2. ```\\n...\\n```                  (no language tag at all).
+      3. raw <!doctype...</html>         (HTML emitted with no fence -- the
+                                            common Gemini failure mode for
+                                            non-Python artifacts).
+      4. ```<lang>\\n...                 (truncated -- hit max_tokens before
+                                            the closing fence; let the
+                                            verifier surface the real error).
+      5. ```\\n...                       (truncated, no language tag).
+
+    Greedy on the closing fence: the brief contains nested code-fence examples
+    and a non-greedy match would stop at the first inner fence.
+    """
+    lang_re = re.escape(lang)
+    # 1. Canonical fenced block with the right language tag.
+    m = re.search(rf"```{lang_re}\b\s*\n(.*)\n```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # 2. Fenced block with no language tag (Gemini drops it sometimes).
+    m = re.search(r"```\s*\n(.*)\n```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # 3. HTML-specific: bare <!DOCTYPE ... </html>, no fence at all.
+    if lang == "html":
+        m = re.search(r"(<!doctype\s+html[\s\S]*?</html\s*>)", text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    # 4. Truncated: opening fence with the right lang, no closing fence.
+    m = re.search(rf"```{lang_re}\b\s*\n(.*)", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # 5. Truncated: opening fence, no language, no closing fence.
+    m = re.search(r"```\s*\n(.*)", text, re.DOTALL)
     return m.group(1).strip() if m else None
 
 
@@ -655,18 +906,35 @@ def chat_with_retry(user, agent, message, retries=3) -> str:
     raise last
 
 
-def verify_one_file(work_dir: str, target: str, target_code: str,
-                    priors: dict[str, str]) -> tuple[bool, str]:
+_LANG_BY_EXT = {".py": "python", ".html": "html", ".md": "markdown"}
+
+
+def _lang_for_path(path: str) -> str:
+    """Infer the fenced-block language for a file, defaulting to its bare ext."""
+    ext = Path(path).suffix.lower()
+    return _LANG_BY_EXT.get(ext, ext.lstrip(".") or "text")
+
+
+def verify_python_file(work_dir: str, target: str, target_code: str,
+                       priors: dict[str, str]) -> tuple[bool, str]:
     """Write `target` (plus any `priors` so cross-file imports resolve) into
     work_dir, `python -m py_compile` the target, then `import` the target.
 
     Importing executes the module body. subscriber.py / cli.py / trader.py
     only do safe top-level work (lazy redis client, env-var reads) -- no
     network calls, so this is safe.
+
+    Priors with non-.py extensions (e.g. web/index.html) are still written
+    so they're discoverable from the module under test, but they're not
+    imported.
     """
     for name, code in priors.items():
-        (Path(work_dir) / name).write_text(code)
-    (Path(work_dir) / target).write_text(target_code)
+        p = Path(work_dir) / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(code)
+    target_p = Path(work_dir) / target
+    target_p.parent.mkdir(parents=True, exist_ok=True)
+    target_p.write_text(target_code)
 
     target_mod = target[:-3] if target.endswith(".py") else target
     code = (
@@ -693,8 +961,48 @@ def verify_one_file(work_dir: str, target: str, target_code: str,
     return ok, out.strip()[-3000:]
 
 
+def verify_html_file(work_dir: str, target: str, target_code: str,
+                     priors: dict[str, str]) -> tuple[bool, str]:
+    """Sanity-check an HTML artifact: non-trivial size, declares a doctype,
+    has a closing </html>. We can't run the page server-side; the goal is
+    just to catch obvious truncation / wrong-language emission.
+    """
+    head = target_code.lstrip()[:200].lower()
+    problems = []
+    if len(target_code.strip()) < 200:
+        problems.append(f"file is suspiciously short ({len(target_code)} chars)")
+    if not head.startswith("<!doctype"):
+        problems.append("missing leading <!DOCTYPE html> declaration")
+    if "</html>" not in target_code.lower():
+        problems.append("missing closing </html> tag (likely truncated output)")
+    # Quick heuristic: the LLM sometimes emits a code-fence-of-fences. Bail.
+    if target_code.lstrip().startswith("```"):
+        problems.append("output still contains a leading fence; emit raw HTML")
+    if problems:
+        return False, "HTML verification failed:\n  - " + "\n  - ".join(problems)
+    return True, f"HTML verify OK ({len(target_code)} chars)"
+
+
+def verify(lang: str, work_dir: str, target: str, target_code: str,
+           priors: dict[str, str]) -> tuple[bool, str]:
+    """Dispatch to the per-language verifier."""
+    if lang == "python":
+        return verify_python_file(work_dir, target, target_code, priors)
+    if lang == "html":
+        return verify_html_file(work_dir, target, target_code, priors)
+    # Unknown language: trust the LLM, just check non-empty.
+    if not target_code.strip():
+        return False, f"empty {lang} output"
+    return True, f"no verifier for lang={lang!r}; accepted as-is"
+
+
 def _read_priors(prior_names: list[str]) -> dict[str, str]:
-    """Read prior-stage files from OUT_DIR (skipping any that don't exist)."""
+    """Read prior-stage files from OUT_DIR (skipping any that don't exist).
+
+    Keys are the relative paths exactly as listed in STAGES (e.g.
+    `web/index.html`), so cross-file references in the rendered prompt
+    line up with the on-disk layout the verifier reproduces.
+    """
     out: dict[str, str] = {}
     for n in prior_names:
         p = OUT_DIR / n
@@ -737,9 +1045,9 @@ def run_stage(stage_idx: int, brief_md: str, symbols: list[str],
 
     Looks up the stage from STAGES[stage_idx]. Reads any prior files from
     OUT_DIR (they're context, not regenerated). Loops up to MAX_RETRIES with
-    compile/import errors fed back to the Coder.
+    compile/import (or html-sanity) errors fed back to the Coder.
     """
-    target_file, system_prompt, prior_names = STAGES[stage_idx]
+    stage_name, target_file, lang, system_prompt, prior_names = STAGES[stage_idx]
     target_path = OUT_DIR / target_file
     priors = _read_priors(prior_names)
 
@@ -754,12 +1062,15 @@ def run_stage(stage_idx: int, brief_md: str, symbols: list[str],
 
     priors_md = ""
     for name, code in priors.items():
+        prior_lang = _lang_for_path(name)
         priors_md += (
             f"\n\n### EXISTING: {name} (already on disk; do NOT redefine, "
-            f"use its public surface)\n```python\n{code}\n```"
+            f"use its public surface)\n```{prior_lang}\n{code}\n```"
         )
 
-    work_dir = tempfile.mkdtemp(prefix=f"alpaca_stage_{target_file}_")
+    # Sanitize the work-dir prefix: target_file may contain a "/" (web/index.html)
+    safe_prefix = target_file.replace("/", "_").replace("\\", "_")
+    work_dir = tempfile.mkdtemp(prefix=f"alpaca_stage_{safe_prefix}_")
     feedback = extra_feedback
     code = ""
     try:
@@ -770,7 +1081,7 @@ def run_stage(stage_idx: int, brief_md: str, symbols: list[str],
                 "Research brief:\n\n```markdown\n" + brief_md + "\n```"
                 + priors_md
                 + f"\n\nSYMBOLS (default for subscriber): {symbols}\n"
-                  f"\nGenerate {target_file}. Output ONE fenced ```python``` "
+                  f"\nGenerate {target_file}. Output ONE fenced ```{lang}``` "
                   "block with the full file contents. No prose."
             )
             if feedback:
@@ -780,17 +1091,28 @@ def run_stage(stage_idx: int, brief_md: str, symbols: list[str],
                     f"Fix the issue and re-emit {target_file} in full."
                 )
             raw = chat_with_retry(user, coder, ask)
-            code = extract_block(raw, "python") or ""
+            code = extract_block(raw, lang) or ""
             if not code:
+                # Show the head + tail of the raw response so the operator
+                # can see what the model actually emitted (different fence,
+                # leading prose, etc.) without dumping 30k tokens.
+                head = raw[:400].replace("\n", "\\n")
+                tail = raw[-200:].replace("\n", "\\n") if len(raw) > 600 else ""
+                print(f"            ! no {lang} block extracted from "
+                      f"{len(raw)}-char response; head={head!r}"
+                      + (f" ... tail={tail!r}" if tail else ""))
                 feedback = (
-                    "No ```python``` fenced block found in your output. "
-                    "Output exactly one fenced ```python``` block, no prose."
+                    f"No ```{lang}``` fenced block found in your output. "
+                    f"Output exactly one fenced ```{lang}``` block at the "
+                    f"START of your message, no prose before or after. "
+                    f"The opening fence MUST be three backticks immediately "
+                    f"followed by the literal word `{lang}` then a newline."
                 )
-                print("            ! no python block; retrying")
                 continue
-            ok, out = verify_one_file(work_dir, target_file, code, priors)
+            ok, out = verify(lang, work_dir, target_file, code, priors)
             if ok:
                 print("            verify OK")
+                target_path.parent.mkdir(parents=True, exist_ok=True)
                 target_path.write_text(code + ("" if code.endswith("\n") else "\n"))
                 print(f"            wrote {target_path} ({len(code)} chars)")
                 return True
@@ -798,6 +1120,7 @@ def run_stage(stage_idx: int, brief_md: str, symbols: list[str],
             feedback = out
         # MAX_RETRIES exhausted -- write last attempt for inspection
         if code:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(code + ("" if code.endswith("\n") else "\n"))
             print(f"  [stage:{target_file}] FAILED after {MAX_RETRIES}; "
                   f"wrote last attempt to {target_path} for inspection")
@@ -821,14 +1144,17 @@ def run_pipeline(symbols: list[str], stage_filter: str = "missing",
     print(f"=== alpaca_codegen | model={GEMINI_MODEL} | filter={stage_filter} ===")
     brief_md = ensure_research(force=force_research)
 
+    def _target_of(idx: int) -> str:
+        return STAGES[idx][1]
+
     if stage_filter == "missing":
         to_run = [
-            i for i, (fname, _, _) in enumerate(STAGES)
-            if not (OUT_DIR / fname).exists()
+            i for i in range(len(STAGES))
+            if not (OUT_DIR / _target_of(i)).exists()
         ]
         skipped = [
-            STAGES[i][0] for i in range(len(STAGES))
-            if (OUT_DIR / STAGES[i][0]).exists()
+            _target_of(i) for i in range(len(STAGES))
+            if (OUT_DIR / _target_of(i)).exists()
         ]
         if skipped:
             print(f"  skipping (already present): {skipped}")
@@ -850,7 +1176,7 @@ def run_pipeline(symbols: list[str], stage_filter: str = "missing",
     results: dict[str, bool] = {}
     for i in to_run:
         ok = run_stage(i, brief_md, symbols)
-        results[STAGES[i][0]] = ok
+        results[_target_of(i)] = ok
 
     print("\n=== Summary ===")
     for name, ok in results.items():
@@ -895,7 +1221,7 @@ def run_fix(error_text: str, stage: str, symbols: list[str]) -> None:
     )
     ok = run_stage(STAGE_BY_NAME[stage], brief_md, symbols,
                    extra_feedback=feedback)
-    print(f"\n[fix] {STAGES[STAGE_BY_NAME[stage]][0]}: "
+    print(f"\n[fix] {STAGES[STAGE_BY_NAME[stage]][1]}: "
           + ("OK" if ok else "FAILED"))
 
 
@@ -932,7 +1258,8 @@ HELP = """Usage:
         cli                 -- regenerate only cli.py
         trade_stream        -- regenerate only trade_stream.py
         persister           -- regenerate only persister.py
-        webgui              -- regenerate only webgui.py
+        webgui_html         -- regenerate only generated/web/index.html
+        webgui              -- regenerate only webgui.py (Flask backend)
 
   python alpaca_codegen.py --fix <error_file|-> --stage <name> [SYM ...]
       Re-engage the Coder for one stage with a runtime traceback as feedback.

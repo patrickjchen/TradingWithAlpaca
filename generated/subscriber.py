@@ -1,128 +1,147 @@
-import asyncio
 import os
-import redis
-import json
-from datetime import datetime
 import sys
-
+import json
+import asyncio
+import argparse
+import redis
 from alpaca.data.live.crypto import CryptoDataStream
-from alpaca.data.models import Trade, Quote
 
-# Default symbols to subscribe to
-SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD']
+DEFAULT_SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD']
 
-# Redis connection
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
-def _clean(d: dict) -> dict:
-    """Removes None values from a dictionary."""
+def _clean(d):
+    """Remove None values from a dictionary for Redis HSET compatibility."""
     return {k: v for k, v in d.items() if v is not None}
 
-def _to_iso_string(dt: datetime) -> str:
-    """Converts a datetime object to an ISO 8601 string."""
-    return dt.isoformat() if dt else None
+async def main():
+    api_key = os.environ.get("ALPACA_API_KEY_ID")
+    secret_key = os.environ.get("ALPACA_API_SECRET_KEY")
+    
+    if not api_key or not secret_key:
+        sys.exit("Error: ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY environment variables must be set.")
 
-async def trade_handler(trade: Trade):
-    """
-    Handles incoming trade data, stores it in Redis.
-    """
-    symbol = trade.symbol
-    # Store latest trade data
-    latest_data = _clean({
-        "price": trade.price,
-        "size": trade.size,
-        "timestamp": _to_iso_string(trade.timestamp),
-        "exchange": trade.exchange,
-        "id": trade.id,
-        "conditions": ','.join(trade.conditions or []) # conditions can be None
-    })
-    if latest_data:
-        r.hset(f"alpaca:latest:{symbol}", mapping=latest_data)
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    r = redis.Redis.from_url(redis_url, decode_responses=True)
 
-    # Store recent trades (LPUSH and LTRIM)
-    trade_json = json.dumps(_clean({
-        "symbol": symbol,
-        "price": trade.price,
-        "size": trade.size,
-        "timestamp": _to_iso_string(trade.timestamp),
-        "exchange": trade.exchange,
-        "id": trade.id,
-        "conditions": trade.conditions or []
-    }), default=str)
-    r.lpush(f"alpaca:recent:{symbol}:trade", trade_json)
-    r.ltrim(f"alpaca:recent:{symbol}:trade", 0, 99)
+    parser = argparse.ArgumentParser(description="Alpaca Crypto Market Data Subscriber")
+    parser.add_argument("symbols", nargs="*", default=DEFAULT_SYMBOLS, help="List of crypto symbols to subscribe to")
+    args = parser.parse_args()
+    symbols = args.symbols
 
-    # Add symbol to the set of known symbols
-    r.sadd("alpaca:symbols", symbol)
+    stream = CryptoDataStream(api_key=api_key, secret_key=secret_key)
 
-async def quote_handler(quote: Quote):
-    """
-    Handles incoming quote data, stores it in Redis.
-    """
-    symbol = quote.symbol
-    # Store latest quote data
-    latest_data = _clean({
-        "bid_price": quote.bid_price,
-        "bid_size": quote.bid_size,
-        "ask_price": quote.ask_price,
-        "ask_size": quote.ask_size,
-        "timestamp": _to_iso_string(quote.timestamp),
-        "bid_exchange": quote.bid_exchange,
-        "ask_exchange": quote.ask_exchange,
-    })
-    if latest_data:
-        r.hset(f"alpaca:latest:{symbol}", mapping=latest_data)
+    async def trade_handler(trade):
+        symbol = trade.symbol
+        timestamp_iso = trade.timestamp.isoformat() if trade.timestamp else None
+        
+        data = {
+            "price": float(trade.price),
+            "size": float(trade.size),
+            "timestamp": timestamp_iso,
+            "exchange": str(trade.exchange) if trade.exchange else None,
+            "conditions": trade.conditions or [],
+            "id": trade.id
+        }
+        
+        # Update latest fields
+        latest_mapping = _clean({
+            "price": data["price"],
+            "timestamp": data["timestamp"]
+        })
+        if latest_mapping:
+            r.hset(f"alpaca:latest:{symbol}", mapping=latest_mapping)
+            
+        # Push to recent trades
+        recent_key = f"alpaca:recent:{symbol}:trade"
+        r.lpush(recent_key, json.dumps(data, default=str))
+        r.ltrim(recent_key, 0, 99)
+        
+        # Add to known symbols
+        r.sadd("alpaca:symbols", symbol)
 
-    # Store recent quotes (LPUSH and LTRIM)
-    quote_json = json.dumps(_clean({
-        "symbol": symbol,
-        "bid_price": quote.bid_price,
-        "bid_size": quote.bid_size,
-        "ask_price": quote.ask_price,
-        "ask_size": quote.ask_size,
-        "timestamp": _to_iso_string(quote.timestamp),
-        "bid_exchange": quote.bid_exchange,
-        "ask_exchange": quote.ask_exchange,
-    }), default=str)
-    r.lpush(f"alpaca:recent:{symbol}:quote", quote_json)
-    r.ltrim(f"alpaca:recent:{symbol}:quote", 0, 99)
+    async def quote_handler(quote):
+        symbol = quote.symbol
+        timestamp_iso = quote.timestamp.isoformat() if quote.timestamp else None
+        
+        data = {
+            "bid_price": float(quote.bid_price),
+            "bid_size": float(quote.bid_size),
+            "ask_price": float(quote.ask_price),
+            "ask_size": float(quote.ask_size),
+            "timestamp": timestamp_iso,
+            "bid_exchange": str(quote.bid_exchange) if quote.bid_exchange else None,
+            "ask_exchange": str(quote.ask_exchange) if quote.ask_exchange else None
+        }
+        
+        # Update latest fields
+        latest_mapping = _clean({
+            "bid_price": data["bid_price"],
+            "bid_size": data["bid_size"],
+            "ask_price": data["ask_price"],
+            "ask_size": data["ask_size"],
+            "timestamp": data["timestamp"]
+        })
+        if latest_mapping:
+            r.hset(f"alpaca:latest:{symbol}", mapping=latest_mapping)
+            
+        # Push to recent quotes
+        recent_key = f"alpaca:recent:{symbol}:quote"
+        r.lpush(recent_key, json.dumps(data, default=str))
+        r.ltrim(recent_key, 0, 99)
+        
+        # Add to known symbols
+        r.sadd("alpaca:symbols", symbol)
 
-    # Add symbol to the set of known symbols
-    r.sadd("alpaca:symbols", symbol)
+    async def orderbook_handler(orderbook):
+        # Alpaca's crypto orderbook websocket delivers DELTAS, not full
+        # snapshots: each message contains only the levels that changed.
+        # Merge into per-side HASHes (HSET on size>0, HDEL on size==0)
+        # so the accumulated book lives in Redis. NEVER overwrite the
+        # whole book or you lose all but the most recent delta.
+        symbol = orderbook.symbol
+        timestamp_iso = orderbook.timestamp.isoformat() if orderbook.timestamp else None
 
-async def main(symbols_to_subscribe: list):
-    api_key_id = os.environ.get("ALPACA_API_KEY_ID")
-    api_secret_key = os.environ.get("ALPACA_API_SECRET_KEY")
+        bids_key = f"alpaca:ob:bids:{symbol}"
+        asks_key = f"alpaca:ob:asks:{symbol}"
 
-    if not api_key_id or not api_secret_key:
-        print("Error: ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY must be set as environment variables.", file=sys.stderr)
-        sys.exit(1)
+        def _pf(p):  # canonical price field-name so updates land idempotently
+            return f"{float(p):.10g}"
 
-    stream = CryptoDataStream(api_key_id, api_secret_key)
+        pipe = r.pipeline()
+        for lv in (orderbook.bids or []):
+            field = _pf(lv.price)
+            size = float(lv.size)
+            if size > 0:
+                pipe.hset(bids_key, field, size)
+            else:
+                pipe.hdel(bids_key, field)
+        for lv in (orderbook.asks or []):
+            field = _pf(lv.price)
+            size = float(lv.size)
+            if size > 0:
+                pipe.hset(asks_key, field, size)
+            else:
+                pipe.hdel(asks_key, field)
 
-    print(f"Subscribing to trades and quotes for: {', '.join(symbols_to_subscribe)}")
-    stream.subscribe_trades(trade_handler, *symbols_to_subscribe)
-    stream.subscribe_quotes(quote_handler, *symbols_to_subscribe)
+        # Metadata hash (book itself lives in the per-side hashes above).
+        meta = _clean({"symbol": symbol, "timestamp": timestamp_iso})
+        if meta:
+            pipe.hset(f"alpaca:orderbook:{symbol}", mapping=meta)
+
+        pipe.sadd("alpaca:symbols", symbol)
+        pipe.execute()
+
+    print(f"Subscribing to trades, quotes, and orderbooks for: {', '.join(symbols)}")
+    stream.subscribe_trades(trade_handler, *symbols)
+    stream.subscribe_quotes(quote_handler, *symbols)
+    stream.subscribe_orderbooks(orderbook_handler, *symbols)
 
     try:
         await stream._run_forever()
     finally:
-        print("Closing stream...")
         await stream.close()
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Alpaca Crypto Data Subscriber")
-    parser.add_argument(
-        "symbols",
-        nargs="*",
-        default=SYMBOLS,
-        help=f"Crypto symbols to subscribe to (e.g., BTC/USD ETH/USD). Defaults to {', '.join(SYMBOLS)}."
-    )
-    args = parser.parse_args()
-
     try:
-        asyncio.run(main(args.symbols))
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("Subscriber stopped by user.")
+        print("\nExiting subscriber...")

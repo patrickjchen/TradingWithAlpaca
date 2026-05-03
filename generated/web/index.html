@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alpaca Crypto UI</title>
+<style>
+    :root {
+        --bg: #121212;
+        --surface: #1e1e1e;
+        --text: #e0e0e0;
+        --text-muted: #888;
+        --border: #333;
+        --ask-color: #ff5252;
+        --ask-bg: rgba(255, 82, 82, 0.1);
+        --ask-hover: rgba(255, 82, 82, 0.2);
+        --bid-color: #69f0ae;
+        --bid-bg: rgba(105, 240, 174, 0.1);
+        --bid-hover: rgba(105, 240, 174, 0.2);
+        --primary: #2979ff;
+        --primary-hover: #1c54b2;
+    }
+    body {
+        margin: 0; padding: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background-color: var(--bg); color: var(--text);
+    }
+    header {
+        display: flex; align-items: center; gap: 15px;
+        padding: 10px 20px; background-color: var(--surface);
+        border-bottom: 1px solid var(--border);
+    }
+    header h1 { margin: 0; font-size: 1.2rem; }
+    select, button, input {
+        background: var(--bg); color: var(--text);
+        border: 1px solid var(--border); padding: 5px 10px;
+        border-radius: 4px; font-size: 0.9rem;
+    }
+    button { cursor: pointer; background: var(--surface); }
+    button:hover { background: var(--border); }
+    button.primary { background: var(--primary); color: #fff; border: none; }
+    button.primary:hover { background: var(--primary-hover); }
+    
+    .tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); }
+    .tab-btn {
+        flex: 1; padding: 10px; border: none; background: none;
+        color: var(--text-muted); cursor: pointer; font-weight: bold;
+    }
+    .tab-btn.active { color: var(--primary); border-bottom: 2px solid var(--primary); }
+    
+    .tab-content { display: none; padding: 20px; }
+    .tab-content.active { display: block; }
+
+    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 0.9rem; }
+    th, td { padding: 8px; text-align: right; border-bottom: 1px solid var(--border); }
+    th { color: var(--text-muted); font-weight: normal; }
+    th:first-child, td:first-child { text-align: left; }
+    
+    /* Escalator */
+    .ladder { width: 400px; margin: 0 auto; font-family: monospace; border: 1px solid var(--border); }
+    .ladder th, .ladder td { border: none; padding: 4px 8px; }
+    .ask-row { color: var(--ask-color); cursor: pointer; }
+    .ask-row:hover { background-color: var(--ask-hover); }
+    .bid-row { color: var(--bid-color); cursor: pointer; }
+    .bid-row:hover { background-color: var(--bid-hover); }
+    .spread-row { text-align: center !important; background: var(--surface); color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .empty-row { height: 24px; }
+    .meta-line { text-align: center; color: var(--text-muted); font-size: 0.8rem; margin-top: 10px; }
+
+    /* Summary & Activity */
+    .controls-row { display: flex; justify-content: space-between; margin-bottom: 15px; align-items: center; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+    .card { background: var(--surface); padding: 15px; border-radius: 4px; border: 1px solid var(--border); }
+    .card-title { color: var(--text-muted); font-size: 0.8rem; margin-bottom: 5px; }
+    .card-value { font-size: 1.2rem; font-weight: bold; }
+
+    /* Modal */
+    #modal-overlay {
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.7); display: none;
+        align-items: center; justify-content: center; z-index: 1000;
+    }
+    .modal {
+        background: var(--surface); padding: 20px; border-radius: 8px;
+        width: 300px; border: 1px solid var(--border);
+    }
+    .modal h3 { margin-top: 0; margin-bottom: 15px; }
+    .form-group { margin-bottom: 15px; }
+    .form-group label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size: 0.8rem; }
+    .form-group input[type="number"], .form-group input[type="text"] { width: 100%; box-sizing: border-box; }
+    .radio-group { display: flex; gap: 10px; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+
+    /* Toast */
+    #toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 2000; display: flex; flex-direction: column; gap: 10px; }
+    .toast { background: var(--surface); border: 1px solid var(--border); padding: 10px 15px; border-radius: 4px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); font-size: 0.9rem; }
+    .toast.error { border-left: 4px solid var(--ask-color); }
+    .toast.success { border-left: 4px solid var(--bid-color); }
+</style>
+</head>
+<body>
+
+<header>
+    <h1>Alpaca Crypto</h1>
+    <button onclick="refreshCurrentTab()">Refresh</button>
+</header>
+
+<div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('escalator')" id="btn-escalator">Escalator</button>
+    <button class="tab-btn" onclick="switchTab('activity')" id="btn-activity">Activity</button>
+    <button class="tab-btn" onclick="switchTab('summary')" id="btn-summary">Summary</button>
+</div>
+
+<!-- TAB 1: ESCALATOR -->
+<div id="tab-escalator" class="tab-content active">
+    <div class="controls-row">
+        <label>Symbol
+            <select id="global-symbol" onchange="onSymbolChange()"><option value="">Loading...</option></select>
+        </label>
+    </div>
+    <table class="ladder">
+        <thead><tr><th>Side</th><th>Price</th><th>Size</th></tr></thead>
+        <tbody id="escalator-tbody">
+            <!-- 21 rows injected here -->
+        </tbody>
+    </table>
+    <div class="meta-line" id="escalator-meta">(no data)</div>
+</div>
+
+<!-- TAB 2: ACTIVITY -->
+<div id="tab-activity" class="tab-content">
+    <div class="controls-row">
+        <div>
+            <label for="activity-status">Status: </label>
+            <select id="activity-status" onchange="loadActivity()">
+                <option value="">All</option>
+                <option value="open">Open</option>
+                <option value="filled">Filled</option>
+                <option value="canceled">Canceled</option>
+            </select>
+        </div>
+        <button onclick="loadActivity()">Refresh Activity</button>
+    </div>
+    
+    <h3>Orders</h3>
+    <table>
+        <thead><tr><th>Time</th><th>ID</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Filled</th><th>Status</th><th>Action</th></tr></thead>
+        <tbody id="orders-tbody"></tbody>
+    </table>
+
+    <h3>Fills</h3>
+    <table>
+        <thead><tr><th>Time</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Event</th></tr></thead>
+        <tbody id="fills-tbody"></tbody>
+    </table>
+</div>
+
+<!-- TAB 3: SUMMARY -->
+<div id="tab-summary" class="tab-content">
+    <div class="controls-row">
+        <label><input type="checkbox" id="summary-live" onchange="loadSummary()"> Live Trading (Real Money)</label>
+        <button onclick="loadSummary()">Refresh Summary</button>
+    </div>
+
+    <div class="grid" id="account-grid">
+        <div class="card"><div class="card-title">Equity</div><div class="card-value" id="acc-equity">--</div></div>
+        <div class="card"><div class="card-title">Cash</div><div class="card-value" id="acc-cash">--</div></div>
+        <div class="card"><div class="card-title">Buying Power</div><div class="card-value" id="acc-bp">--</div></div>
+        <div class="card"><div class="card-title">Portfolio Value</div><div class="card-value" id="acc-pv">--</div></div>
+    </div>
+
+    <h3>Positions</h3>
+    <table>
+        <thead><tr><th>Symbol</th><th>Qty</th><th>Avg Entry</th><th>Current Px</th><th>Market Val</th><th>Unrealized PnL</th><th>PnL %</th></tr></thead>
+        <tbody id="positions-tbody"></tbody>
+    </table>
+
+    <h3>Realized PnL</h3>
+    <table>
+        <thead><tr><th>Symbol</th><th>Realized PnL ($)</th></tr></thead>
+        <tbody id="pnl-tbody"></tbody>
+    </table>
+</div>
+
+<!-- ORDER MODAL -->
+<div id="modal-overlay">
+    <div class="modal" id="order-modal">
+        <h3 id="modal-title">Place Order</h3>
+        <div class="form-group">
+            <label>Symbol</label>
+            <input type="text" id="modal-symbol" readonly>
+        </div>
+        <div class="form-group">
+            <label>Side</label>
+            <input type="text" id="modal-side" readonly>
+        </div>
+        <div class="form-group">
+            <label>Type</label>
+            <div class="radio-group">
+                <label><input type="radio" name="modal-type" value="market" onchange="toggleLimitInput()"> Market</label>
+                <label><input type="radio" name="modal-type" value="limit" checked onchange="toggleLimitInput()"> Limit</label>
+            </div>
+        </div>
+        <div class="form-group" id="modal-limit-group">
+            <label>Limit Price</label>
+            <input type="number" id="modal-limit" step="any">
+        </div>
+        <div class="form-group">
+            <label>Quantity</label>
+            <input type="number" id="modal-qty" step="any" min="0.00000001">
+        </div>
+        <div class="form-group">
+            <label><input type="checkbox" id="modal-live"> Live Order</label>
+        </div>
+        <div class="modal-actions">
+            <button onclick="closeModal()">Cancel</button>
+            <button class="primary" onclick="submitOrder()">Submit</button>
+        </div>
+    </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+    let currentTab = 'escalator';
+    let pollInterval = null;
+
+    // Initialization
+    window.onload = async () => {
+        await loadSymbols();
+        switchTab('escalator');
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && document.getElementById('modal-overlay').style.display === 'flex') {
+                closeModal();
+            }
+        });
+        document.getElementById('order-modal').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') submitOrder();
+        });
+    };
+
+    function showToast(msg, type='success') {
+        const container = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        toast.textContent = msg;
+        container.appendChild(toast);
+        setTimeout(() => toast.remove(), 3000);
+    }
+
+    function formatNum(val, decimals=2) {
+        if (val === null || val === undefined || isNaN(val)) return '';
+        return Number(val).toLocaleString(undefined, {minimumFractionDigits: decimals, maximumFractionDigits: 6});
+    }
+
+    async function loadSymbols() {
+        try {
+            const res = await fetch('/api/symbols');
+            const symbols = await res.json();
+            const sel = document.getElementById('global-symbol');
+            sel.innerHTML = '';
+            if (!symbols || symbols.length === 0) {
+                sel.innerHTML = '<option value="">(no symbols)</option>';
+                return;
+            }
+            symbols.forEach(s => {
+                const opt = document.createElement('option');
+                opt.value = s; opt.textContent = s;
+                sel.appendChild(opt);
+            });
+        } catch (e) {
+            document.getElementById('global-symbol').innerHTML = '<option value="">Error</option>';
+        }
+    }
+
+    function onSymbolChange() {
+        if (currentTab === 'escalator') fetchOrderbook();
+    }
+
+    function switchTab(tab) {
+        currentTab = tab;
+        document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+        document.getElementById(`tab-${tab}`).classList.add('active');
+        document.getElementById(`btn-${tab}`).classList.add('active');
+
+        if (pollInterval) clearInterval(pollInterval);
+
+        if (tab === 'escalator') {
+            fetchOrderbook();
+            pollInterval = setInterval(fetchOrderbook, 1000);
+        } else if (tab === 'activity') {
+            loadActivity();
+        } else if (tab === 'summary') {
+            loadSummary();
+        }
+    }
+
+    function refreshCurrentTab() {
+        if (currentTab === 'escalator') fetchOrderbook();
+        else if (currentTab === 'activity') loadActivity();
+        else if (currentTab === 'summary') loadSummary();
+    }
+
+    // --- ESCALATOR ---
+    async function fetchOrderbook() {
+        const sym = document.getElementById('global-symbol').value;
+        if (!sym) return;
+        try {
+            const res = await fetch(`/api/orderbook/${encodeURIComponent(sym)}`);
+            const data = await res.json();
+            renderEscalator(data, sym);
+        } catch (e) {
+            renderEscalator({bids:[], asks:[], fallback: "error"}, sym);
+        }
+    }
+
+    function renderEscalator(data, sym) {
+        const tbody = document.getElementById('escalator-tbody');
+        tbody.innerHTML = '';
+
+        let asks = (data.asks || []).slice(0, 10);
+        let bids = (data.bids || []).slice(0, 10);
+
+        // Pad asks to 10, then reverse so highest price is at top
+        while(asks.length < 10) asks.push(null);
+        asks.reverse();
+
+        // Pad bids to 10 (already highest to lowest)
+        while(bids.length < 10) bids.push(null);
+
+        // Render Asks
+        asks.forEach(ask => {
+            if (!ask) tbody.appendChild(createEmptyRow());
+            else tbody.appendChild(createLadderRow(ask, 'ask', sym));
+        });
+
+        // Render Spread
+        const trSpread = document.createElement('tr');
+        if (data.asks && data.asks[0] && data.bids && data.bids[0]) {
+            const bestAsk = parseFloat(data.asks[0].price);
+            const bestBid = parseFloat(data.bids[0].price);
+            const spread = bestAsk - bestBid;
+            const bps = bestBid > 0 ? (spread / bestBid) * 10000 : 0;
+            trSpread.innerHTML = `<td colspan="3" class="spread-row">Spread: ${formatNum(spread, 2)} (${formatNum(bps, 1)} bps)</td>`;
+        } else {
+            trSpread.innerHTML = `<td colspan="3" class="spread-row">(no spread)</td>`;
+        }
+        tbody.appendChild(trSpread);
+
+        // Render Bids
+        bids.forEach(bid => {
+            if (!bid) tbody.appendChild(createEmptyRow());
+            else tbody.appendChild(createLadderRow(bid, 'bid', sym));
+        });
+
+        // Meta
+        const ts = data.timestamp || new Date().toISOString();
+        const fb = data.fallback ? `[${data.fallback}]` : '';
+        document.getElementById('escalator-meta').textContent = `${sym} | ${ts} ${fb}`;
+    }
+
+    function createEmptyRow() {
+        const tr = document.createElement('tr');
+        tr.className = 'empty-row';
+        tr.innerHTML = `<td></td><td></td><td></td>`;
+        return tr;
+    }
+
+    function createLadderRow(level, side, sym) {
+        const tr = document.createElement('tr');
+        tr.className = side === 'ask' ? 'ask-row' : 'bid-row';
+        tr.innerHTML = `
+            <td>${side.toUpperCase()}</td>
+            <td>${formatNum(level.price, 2)}</td>
+            <td>${formatNum(level.size, 4)}</td>
+        `;
+        tr.onclick = () => openModal(sym, side === 'ask' ? 'buy' : 'sell', level.price);
+        return tr;
+    }
+
+    // --- ACTIVITY ---
+    async function loadActivity() {
+        const status = document.getElementById('activity-status').value;
+        let url = `/api/orders?limit=50`;
+        if (status) url += `&status=${status}`;
+        
+        try {
+            const [resOrders, resFills] = await Promise.all([
+                fetch(url),
+                fetch(`/api/fills?limit=50`)
+            ]);
+            const orders = await resOrders.json();
+            const fills = await resFills.json();
+            renderOrders(orders);
+            renderFills(fills);
+        } catch (e) {
+            showToast("Failed to load activity", "error");
+        }
+    }
+
+    function renderOrders(orders) {
+        const tbody = document.getElementById('orders-tbody');
+        tbody.innerHTML = '';
+        if (!orders || orders.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="9" style="text-align:center">(no rows)</td></tr>';
+            return;
+        }
+        const activeStatuses = ['new', 'accepted', 'pending_new', 'partially_filled'];
+        orders.forEach(o => {
+            const tr = document.createElement('tr');
+            const shortId = (o.order_id || '').substring(0, 8);
+            const isLive = document.getElementById('summary-live').checked ? 1 : 0;
+            let actionHtml = '';
+            if (activeStatuses.includes(o.status)) {
+                actionHtml = `<button onclick="cancelOrder('${o.order_id}', ${isLive})">Cancel</button>`;
+            }
+            tr.innerHTML = `
+                <td>${o.submitted_at || ''}</td>
+                <td title="${o.order_id}">${shortId}</td>
+                <td>${o.symbol || ''}</td>
+                <td>${o.side || ''}</td>
+                <td>${o.type || ''}</td>
+                <td>${formatNum(o.qty, 4)}</td>
+                <td>${formatNum(o.filled_qty, 4)}</td>
+                <td>${o.status || ''}</td>
+                <td>${actionHtml}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
+
+    function renderFills(fills) {
+        const tbody = document.getElementById('fills-tbody');
+        tbody.innerHTML = '';
+        if (!fills || fills.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center">(no rows)</td></tr>';
+            return;
+        }
+        fills.forEach(f => {
+            const tr = document.createElement('tr');
+            const shortId = (f.order_id || '').substring(0, 8);
+            tr.innerHTML = `
+                <td>${f.ts || ''}</td>
+                <td title="${f.order_id}">${shortId}</td>
+                <td>${f.symbol || ''}</td>
+                <td>${f.side || ''}</td>
+                <td>${formatNum(f.qty, 4)}</td>
+                <td>${formatNum(f.price, 2)}</td>
+                <td>${f.event || ''}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
+
+    async function cancelOrder(id, isLive) {
+        try {
+            const res = await fetch(`/api/order/${id}?live=${isLive}`, { method: 'DELETE' });
+            const data = await res.json();
+            if (res.ok) {
+                showToast("Order canceled");
+                loadActivity();
+            } else {
+                showToast(data.error || "Cancel failed", "error");
+            }
+        } catch (e) {
+            showToast("Cancel request failed", "error");
+        }
+    }
+
+    // --- SUMMARY ---
+    async function loadSummary() {
+        const isLive = document.getElementById('summary-live').checked ? 1 : 0;
+        try {
+            const res = await fetch(`/api/summary?live=${isLive}`);
+            const data = await res.json();
+            
+            const acc = data.account || {};
+            document.getElementById('acc-equity').textContent = formatNum(acc.equity);
+            document.getElementById('acc-cash').textContent = formatNum(acc.cash);
+            document.getElementById('acc-bp').textContent = formatNum(acc.buying_power);
+            document.getElementById('acc-pv').textContent = formatNum(acc.portfolio_value);
+
+            const posTbody = document.getElementById('positions-tbody');
+            posTbody.innerHTML = '';
+            const positions = data.positions || [];
+            if (positions.length === 0) {
+                posTbody.innerHTML = '<tr><td colspan="7" style="text-align:center">(no positions)</td></tr>';
+            } else {
+                positions.forEach(p => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td>${p.symbol}</td>
+                        <td>${formatNum(p.qty, 4)}</td>
+                        <td>${formatNum(p.avg_entry_price)}</td>
+                        <td>${formatNum(p.current_price)}</td>
+                        <td>${formatNum(p.market_value)}</td>
+                        <td>${formatNum(p.unrealized_pl)}</td>
+                        <td>${formatNum(p.unrealized_plpc * 100)}%</td>
+                    `;
+                    posTbody.appendChild(tr);
+                });
+            }
+
+            const pnlTbody = document.getElementById('pnl-tbody');
+            pnlTbody.innerHTML = '';
+            const pnl = data.realized_pnl_by_symbol || {};
+            let totalPnl = 0;
+            const pnlKeys = Object.keys(pnl);
+            if (pnlKeys.length === 0) {
+                pnlTbody.innerHTML = '<tr><td colspan="2" style="text-align:center">(no realized PnL)</td></tr>';
+            } else {
+                pnlKeys.forEach(sym => {
+                    const val = parseFloat(pnl[sym]) || 0;
+                    totalPnl += val;
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `<td>${sym}</td><td>${formatNum(val)}</td>`;
+                    pnlTbody.appendChild(tr);
+                });
+                const trTotal = document.createElement('tr');
+                trTotal.style.fontWeight = 'bold';
+                trTotal.innerHTML = `<td>Total</td><td>${formatNum(totalPnl)}</td>`;
+                pnlTbody.appendChild(trTotal);
+            }
+        } catch (e) {
+            showToast("Failed to load summary", "error");
+        }
+    }
+
+    // --- MODAL ---
+    function openModal(sym, side, price) {
+        document.getElementById('modal-symbol').value = sym;
+        document.getElementById('modal-side').value = side;
+        document.querySelector('input[name="modal-type"][value="limit"]').checked = true;
+        document.getElementById('modal-limit').value = price;
+        document.getElementById('modal-qty').value = '';
+        document.getElementById('modal-live').checked = document.getElementById('summary-live').checked;
+        toggleLimitInput();
+        document.getElementById('modal-overlay').style.display = 'flex';
+        document.getElementById('modal-qty').focus();
+    }
+
+    function closeModal() {
+        document.getElementById('modal-overlay').style.display = 'none';
+    }
+
+    function toggleLimitInput() {
+        const type = document.querySelector('input[name="modal-type"]:checked').value;
+        document.getElementById('modal-limit-group').style.display = type === 'limit' ? 'block' : 'none';
+    }
+
+    async function submitOrder() {
+        const sym = document.getElementById('modal-symbol').value;
+        const side = document.getElementById('modal-side').value;
+        const type = document.querySelector('input[name="modal-type"]:checked').value;
+        const limit = document.getElementById('modal-limit').value;
+        const qty = document.getElementById('modal-qty').value;
+        const live = document.getElementById('modal-live').checked;
+
+        if (!qty || parseFloat(qty) <= 0) {
+            showToast("Quantity must be > 0", "error");
+            return;
+        }
+        if (type === 'limit' && (!limit || parseFloat(limit) <= 0)) {
+            showToast("Valid limit price required", "error");
+            return;
+        }
+
+        if (live) {
+            if (!confirm("This will place a REAL order. Continue?")) return;
+        }
+
+        const payload = {
+            symbol: sym,
+            side: side,
+            type: type,
+            qty: parseFloat(qty),
+            live: live ? 1 : 0
+        };
+        if (type === 'limit') payload.limit_price = parseFloat(limit);
+
+        try {
+            const res = await fetch('/api/order', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showToast(`Order placed: ${data.id ? data.id.substring(0,8) : 'Success'}`);
+                closeModal();
+            } else {
+                showToast(data.error || "Order failed", "error");
+            }
+        } catch (e) {
+            showToast("Request failed", "error");
+        }
+    }
+</script>
+</body>
+</html>
