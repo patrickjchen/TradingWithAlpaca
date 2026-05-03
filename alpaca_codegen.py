@@ -27,6 +27,11 @@ Three AG2 agents collaborate (Gemini 2.5 Flash via OpenRouter):
         persister.py    -- consumer-group reader on the Redis Stream that
                            writes orders / fills / a full audit log into a
                            local SQLite db. No websocket of its own.
+        webgui.py       -- Flask web UI: 3 tabs (Escalator with live
+                           bid/ask + click-to-trade dialog; Orders & Fills
+                           from SQLite; Summary with account/positions/PnL).
+                           Reads Redis (subscriber's keys) and SQLite
+                           (persister's tables); proxies orders via trader.
   3. Verifier  (UserProxyAgent + LocalCommandLineCodeExecutor) -> byte-compiles
      each generated file and imports it. We do NOT place live orders or open
      a websocket -- that requires real creds and a Redis server -- but a clean
@@ -37,10 +42,10 @@ Up to MAX_RETRIES rounds: on compile failure the error is fed back to the Coder.
 Usage:
     python alpaca_codegen.py
         # writes RESEARCH.md + subscriber.py + trader.py + cli.py
-        #        + trade_stream.py + persister.py into ./generated/
+        #        + trade_stream.py + persister.py + webgui.py into ./generated/
 
 Then to actually use what was generated:
-    pip install alpaca-py redis
+    pip install alpaca-py redis flask
     export ALPACA_API_KEY_ID=...  ALPACA_API_SECRET_KEY=...
     # start a redis server (e.g. `docker run -p 6379:6379 redis`)
     python generated/subscriber.py             # market data -> Redis
@@ -49,6 +54,7 @@ Then to actually use what was generated:
     python generated/cli.py latest BTC/USD     # query market data
     python generated/cli.py account            # paper account balance
     python generated/cli.py buy BTC/USD 0.001  # paper market buy
+    python generated/webgui.py                 # web UI on http://127.0.0.1:5000
 """
 
 import os
@@ -475,6 +481,129 @@ REQUIREMENTS:
   - Handle KeyboardInterrupt cleanly: close db + redis, then exit. Module
     imports must NOT touch the network -- only `main()` does."""
 
+WEBGUI_SYS = CODER_PREAMBLE + """
+
+You are generating: webgui.py
+
+Long-running Flask web UI for monitoring market data, recent orders/fills,
+and submitting paper trades. Reads real-time bid/ask from Redis (the same
+keys subscriber.py writes), reads order/fill history from SQLite (the same
+schema persister.py writes), and proxies order placement through trader.py.
+You will receive subscriber.py, trader.py, and persister.py as context --
+do NOT redefine them; use their public surface and key/schema conventions.
+
+REQUIREMENTS:
+  - Use Flask. Module-level work is allowed (`app = Flask(__name__)`,
+    route decorators) but do NOT call `app.run()` at import time -- only
+    inside `if __name__ == "__main__":` so the verifier (which imports
+    the module) doesn't bind a port.
+  - Read REDIS_URL the same way subscriber.py does
+    (`os.environ.get("REDIS_URL", "redis://localhost:6379/0")`,
+    `decode_responses=True`).
+  - Read ALPACA_DB_PATH the same way persister.py does
+    (`os.environ.get("ALPACA_DB_PATH", "./alpaca.db")`).
+  - Import trader as `import trader` (same directory) for order placement.
+  - Default bind: host=os.environ.get("WEBGUI_HOST", "127.0.0.1"),
+    port=int(os.environ.get("WEBGUI_PORT", "5000")). Print the URL on
+    startup. `debug=False`.
+
+  THREE TABS in a single HTML page (use `render_template_string` with one
+  inline template). Tabs are switched client-side via plain JS; do NOT
+  create separate routes per tab. Vanilla JS only -- no React/Vue/jQuery.
+  Minimal inline CSS. Use fetch() + setInterval for polling.
+
+  Tab 1: "Escalator" -- real-time bid/ask board.
+    - Table with columns: symbol, bid_price, bid_size, ask_price, ask_size,
+      last price, timestamp. Field names match subscriber.py's HSET payload
+      exactly: `bid_price`, `bid_size`, `ask_price`, `ask_size`, `price`
+      (last trade), `timestamp`. Some fields may be absent for a symbol
+      that has only had trades-or-only-quotes -- render empty cell, not
+      "undefined".
+    - Row population: GET /api/latest_all every 1000ms, replace table body.
+    - Each row is clickable. Clicking opens a modal dialog (an absolutely
+      positioned `<div>` toggled via JS -- no `<dialog>` element, for
+      browser compatibility) with these inputs:
+        * Symbol: dropdown populated from /api/symbols, pre-selected to
+          the clicked row's symbol.
+        * Side: buy / sell radio buttons.
+        * Type: market / limit radio. If "limit" is chosen, reveal a
+          limit-price number input.
+        * Qty: number input, step="any" (fractional ok).
+        * Live: checkbox, default OFF. When checked, show a JS confirm()
+          "This will place a REAL order. Continue?" before submitting.
+        * Submit: POSTs JSON to /api/order. Show the JSON response (or
+          error) inside the dialog; do not auto-close on success so the
+          user can read the order id.
+        * Close (X) button.
+
+  Tab 2: "Orders & Fills" -- recent activity from SQLite.
+    - Two tables stacked vertically. Manual Refresh button at the top of
+      the tab; no auto-poll (this changes slowly).
+    - Orders table (most-recent 50): columns order_id (truncate to 8
+      chars), symbol, side, type, qty, filled_qty, status, submitted_at.
+      Source: GET /api/orders?limit=50.
+    - Fills table (most-recent 50): columns ts, order_id (truncate to 8),
+      symbol, side, qty, price, event. Source: GET /api/fills?limit=50.
+
+  Tab 3: "Summary" -- account + positions + PnL.
+    - Live toggle (checkbox, default OFF=paper). Manual Refresh button.
+    - Account snapshot: equity, cash, buying_power, portfolio_value (read
+      from trader.account(live)'s dict; some keys may be strings from
+      model_dump -- coerce to float for display when possible).
+    - Positions table: symbol, qty, avg_entry_price, current_price,
+      market_value, unrealized_pl, unrealized_plpc (from
+      trader.positions(live)).
+    - "Realized PnL by symbol" table: aggregated from the SQLite `fills`
+      table. Per-symbol sum of `(price * qty) * (+1 if side=='sell'
+      else -1)`. This is a rough proxy, not GAAP.
+    - All three blocks come from a single GET /api/summary?live=0|1
+      response so the page can refresh atomically.
+
+  JSON API endpoints (each returns JSON; use jsonify):
+    GET  /api/symbols          -> sorted list from SMEMBERS alpaca:symbols.
+                                   Empty list (not 500) if the set is missing.
+    GET  /api/latest_all       -> {symbol: HGETALL alpaca:latest:<SYM>} for
+                                   every symbol in alpaca:symbols. Empty
+                                   dict if no symbols yet.
+    GET  /api/latest/<symbol>  -> HGETALL alpaca:latest:<SYM>. {} if absent.
+    GET  /api/orders?limit=50  -> rows from SQLite orders ORDER BY
+                                   submitted_at DESC LIMIT ?. [] if the db
+                                   file or table is missing.
+    GET  /api/fills?limit=50   -> rows from SQLite fills ORDER BY ts DESC
+                                   LIMIT ?. [] if missing.
+    GET  /api/summary?live=0   -> {"account": {...}, "positions": [...],
+                                   "realized_pnl_by_symbol": {SYM: float}}.
+                                   `live` query arg "1"/"true" enables live;
+                                   anything else is paper.
+    POST /api/order            -> JSON body:
+                                   {"symbol": str, "qty": float,
+                                    "side": "buy"|"sell",
+                                    "type": "market"|"limit",
+                                    "limit_price": float (required if type=limit),
+                                    "live": bool (default false)}
+                                   Validate side, type, required fields.
+                                   On bad input return ({"error": "..."},
+                                   400). Otherwise dispatch to
+                                   trader.buy_market / trader.sell_market /
+                                   trader.buy_limit / trader.sell_limit and
+                                   return its result dict.
+
+  - SQLite reads: open a fresh connection per request
+    (`sqlite3.connect(db_path, check_same_thread=False)`). Wrap each query
+    in `try/except sqlite3.OperationalError` (tables may not exist before
+    persister.py first runs) and return [] on that error. Use
+    `conn.row_factory = sqlite3.Row` and convert rows to dicts so the
+    JSON response has named fields.
+  - Defensive rendering: Escalator must not 500 when Redis is empty.
+    /api/orders /api/fills must not 500 when alpaca.db is missing.
+  - The trader module reads ALPACA_API_KEY_ID/SECRET only inside
+    get_client(); routes that DON'T need trading (everything except
+    /api/order and /api/summary) MUST NOT call any trader.* function, so
+    the page renders even without Alpaca creds set.
+  - Handle KeyboardInterrupt cleanly. Module imports must NOT touch the
+    network."""
+
+
 # Stage registry: ordered tuples of (target_filename, system_prompt, prior_files_to_pass).
 # Prior files are read from OUT_DIR and given to the Coder as `### EXISTING:` context.
 STAGES = [
@@ -489,6 +618,11 @@ STAGES = [
     # websocket. trade_stream.py is provided so the LLM knows the exact
     # shape of the JSON payloads it will be parsing.
     ("persister.py",    PERSISTER_SYS,    ["trade_stream.py"]),
+    # webgui: Flask UI tying everything together. Reads Redis via
+    # subscriber's keys, SQLite via persister's schema, places orders via
+    # trader. All three priors are passed so the LLM has the exact field
+    # names / table columns / function signatures.
+    ("webgui.py",       WEBGUI_SYS,       ["subscriber.py", "trader.py", "persister.py"]),
 ]
 STAGE_BY_NAME = {f[: -len(".py")]: i for i, (f, _, _) in enumerate(STAGES)}
 
@@ -724,12 +858,13 @@ def run_pipeline(symbols: list[str], stage_filter: str = "missing",
         print(f"  {name}: {status}")
 
     print("\nNext steps (paper trading by default):")
-    print("  pip install alpaca-py redis")
+    print("  pip install alpaca-py redis flask")
     print("  export ALPACA_API_KEY_ID=...  ALPACA_API_SECRET_KEY=...")
     print("  # start redis (e.g. docker run -p 6379:6379 redis)")
     print(f"  python {OUT_DIR/'subscriber.py'}            # market-data -> Redis")
     print(f"  python {OUT_DIR/'trade_stream.py'}          # trade updates -> Redis Stream")
     print(f"  python {OUT_DIR/'persister.py'}             # Redis Stream -> SQLite")
+    print(f"  python {OUT_DIR/'webgui.py'}                # web UI on http://127.0.0.1:5000")
     print(f"  python {OUT_DIR/'cli.py'} symbols")
     print(f"  python {OUT_DIR/'cli.py'} latest {symbols[0]}")
     print(f"  python {OUT_DIR/'cli.py'} account")
@@ -797,6 +932,7 @@ HELP = """Usage:
         cli                 -- regenerate only cli.py
         trade_stream        -- regenerate only trade_stream.py
         persister           -- regenerate only persister.py
+        webgui              -- regenerate only webgui.py
 
   python alpaca_codegen.py --fix <error_file|-> --stage <name> [SYM ...]
       Re-engage the Coder for one stage with a runtime traceback as feedback.
