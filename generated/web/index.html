@@ -144,7 +144,7 @@
     
     <h3>Orders</h3>
     <table>
-        <thead><tr><th>Time</th><th>ID</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Filled</th><th>Avg Px ($)</th><th>Notional ($)</th><th>Status</th><th>Action</th></tr></thead>
+        <thead><tr><th>Time</th><th>ID</th><th>Symbol</th><th>Side</th><th>Type</th><th>Limit ($)</th><th>Qty</th><th>Filled</th><th>Avg Px ($)</th><th>Notional ($)</th><th>Status</th><th>Action</th></tr></thead>
         <tbody id="orders-tbody"></tbody>
     </table>
 
@@ -404,7 +404,7 @@
         const tbody = document.getElementById('orders-tbody');
         tbody.innerHTML = '';
         if (!orders || orders.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="11" style="text-align:center">(no rows)</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="12" style="text-align:center">(no rows)</td></tr>';
             return;
         }
         const activeStatuses = ['new', 'accepted', 'pending_new', 'partially_filled'];
@@ -416,6 +416,7 @@
             if (activeStatuses.includes(o.status)) {
                 actionHtml = `<button onclick="cancelOrder('${o.order_id}', ${isLive})">Cancel</button>`;
             }
+            const limitPx = (o.limit_price != null) ? parseFloat(o.limit_price) : null;
             const avgPx = (o.filled_avg_price != null) ? parseFloat(o.filled_avg_price) : null;
             const filledQty = (o.filled_qty != null) ? parseFloat(o.filled_qty) : null;
             const notional = (avgPx != null && filledQty != null) ? avgPx * filledQty : null;
@@ -425,6 +426,7 @@
                 <td>${o.symbol || ''}</td>
                 <td>${o.side || ''}</td>
                 <td>${o.type || ''}</td>
+                <td>${limitPx != null ? formatNum(limitPx, 2) : ''}</td>
                 <td>${formatNum(o.qty, 4)}</td>
                 <td>${formatNum(o.filled_qty, 4)}</td>
                 <td>${avgPx != null ? formatNum(avgPx, 2) : ''}</td>

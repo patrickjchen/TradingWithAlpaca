@@ -17,6 +17,7 @@ def setup_db(db_path: str) -> sqlite3.Connection:
             side TEXT,
             type TEXT,
             qty REAL,
+            limit_price REAL,
             filled_qty REAL,
             filled_avg_price REAL,
             status TEXT,
@@ -26,6 +27,11 @@ def setup_db(db_path: str) -> sqlite3.Connection:
             raw_json TEXT
         )
     ''')
+
+    # Migration: add limit_price column if upgrading from an older schema.
+    cols = {row[1] for row in cursor.execute("PRAGMA table_info(orders)").fetchall()}
+    if "limit_price" not in cols:
+        cursor.execute("ALTER TABLE orders ADD COLUMN limit_price REAL")
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS fills(
@@ -93,21 +99,25 @@ def handle_payload(conn: sqlite3.Connection, payload: dict):
         
         o_filled_qty_raw = order.get("filled_qty")
         o_filled_qty = float(o_filled_qty_raw) if o_filled_qty_raw is not None else None
-        
+
         o_filled_avg_price_raw = order.get("filled_avg_price")
         o_filled_avg_price = float(o_filled_avg_price_raw) if o_filled_avg_price_raw is not None else None
-        
+
+        o_limit_price_raw = order.get("limit_price")
+        o_limit_price = float(o_limit_price_raw) if o_limit_price_raw is not None else None
+
         o_status = order.get("status")
         o_submitted_at = order.get("submitted_at")
         o_updated_at = order.get("updated_at")
         o_created_at = order.get("created_at")
-        
+
         cursor.execute('''
             INSERT INTO orders(order_id, client_order_id, symbol, side, type,
-                qty, filled_qty, filled_avg_price, status,
+                qty, limit_price, filled_qty, filled_avg_price, status,
                 submitted_at, updated_at, created_at, raw_json)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(order_id) DO UPDATE SET
+                limit_price=COALESCE(excluded.limit_price, orders.limit_price),
                 filled_qty=excluded.filled_qty,
                 filled_avg_price=excluded.filled_avg_price,
                 status=excluded.status,
@@ -115,7 +125,7 @@ def handle_payload(conn: sqlite3.Connection, payload: dict):
                 raw_json=excluded.raw_json;
         ''', (
             order_id, o_client_order_id, o_symbol, o_side, o_type,
-            o_qty, o_filled_qty, o_filled_avg_price, o_status,
+            o_qty, o_limit_price, o_filled_qty, o_filled_avg_price, o_status,
             o_submitted_at, o_updated_at, o_created_at, raw_json
         ))
         

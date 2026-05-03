@@ -135,9 +135,12 @@ LLM coder will use as a spec. Two top-level sections:
     cover bars -- we are intentionally NOT subscribing to bars.
   - The shape (field names + types) of the messages the server pushes for
     trades (`t`), quotes (`q`), and orderbooks (`o`). Include the symbol
-    field name. For orderbooks, document that each message is a SNAPSHOT
-    (the full book on each tick, not a delta) with `bids` and `asks` arrays
-    of `{price, size}` levels. Skip bars.
+    field name. For orderbooks, document that the stream is HYBRID: the
+    `Orderbook` model carries a `reset` boolean -- `reset=True` messages
+    are full server-side snapshots (typically the first after subscription
+    and after reconnects), `reset=False` messages are deltas with only the
+    levels that changed (size==0 means "remove this price level"). Each
+    message has `bids` and `asks` arrays of `{price, size}` levels. Skip bars.
   - The recommended Python SDK (`alpaca-py`) classes that wrap this:
     `CryptoDataStream` -- constructor args, `subscribe_trades` /
     `subscribe_quotes` / `subscribe_orderbooks`, async handler signatures
@@ -205,24 +208,37 @@ Durable rules (do NOT regress between iterations):
     add bars even if the brief mentions them.
   - L2 orderbooks: alpaca-py's `CryptoDataStream.subscribe_orderbooks(handler,
     *symbols)` delivers an `Orderbook` model with attrs `symbol`, `timestamp`,
-    `bids`, `asks`. Each side is a LIST of items with `.price` and `.size`
-    (NOT dicts and NOT keyed by exchange). Despite Alpaca's docs claiming
-    snapshots, the websocket actually delivers DELTAS -- each message contains
-    only the levels that changed. The subscriber MUST merge these into
-    accumulated state, NEVER overwrite the whole book. Use per-side Redis
-    HASHes keyed by price for an idempotent merge:
-        for level in book.bids:                       # repeat for asks
-            field = format_price(level.price)         # canonical str, e.g. f"{p:.10g}"
-            if level.size > 0:
-                r.hset(f"alpaca:ob:bids:{symbol}", field, level.size)
-            else:
-                r.hdel(f"alpaca:ob:bids:{symbol}", field)
-    A level with `size == 0` (or a level NOT present in a follow-up message
-    while previously present) means "remove this price level". Format the
-    price field consistently across writes so updates land on the same hash
-    field instead of accumulating duplicates. Also write a small metadata
-    HASH `alpaca:orderbook:<SYM>` with `symbol` + `timestamp` so consumers
-    can show last-update info.
+    `bids`, `asks`, AND `reset: bool`. Each side is a LIST of items with
+    `.price` and `.size` (NOT dicts and NOT keyed by exchange). The stream
+    is HYBRID: when `reset=True` the message is a full server-side snapshot
+    (typically the first message after subscription, also after disconnects);
+    when `reset=False` the message is a delta containing only changed levels
+    (size>0 = upsert, size==0 = remove). The handler MUST honor `reset` --
+    always-replace truncates depth to whatever shallow update arrived last;
+    always-merge accumulates stale levels forever and eventually crosses the
+    book. Use per-side Redis HASHes keyed by canonical price string:
+        bids_key = f"alpaca:ob:bids:{symbol}"
+        asks_key = f"alpaca:ob:asks:{symbol}"
+        def _pf(p): return f"{float(p):.10g}"
+        pipe = r.pipeline()
+        if getattr(book, "reset", False):
+            pipe.delete(bids_key); pipe.delete(asks_key)
+            bid_map = {_pf(lv.price): float(lv.size) for lv in book.bids if float(lv.size) > 0}
+            ask_map = {_pf(lv.price): float(lv.size) for lv in book.asks if float(lv.size) > 0}
+            if bid_map: pipe.hset(bids_key, mapping=bid_map)
+            if ask_map: pipe.hset(asks_key, mapping=ask_map)
+        else:
+            for lv in book.bids:
+                f = _pf(lv.price); s = float(lv.size)
+                pipe.hset(bids_key, f, s) if s > 0 else pipe.hdel(bids_key, f)
+            for lv in book.asks:
+                f = _pf(lv.price); s = float(lv.size)
+                pipe.hset(asks_key, f, s) if s > 0 else pipe.hdel(asks_key, f)
+        pipe.execute()
+    Format the price field consistently across writes so the same level
+    lands on the same hash field. Also write a small metadata HASH
+    `alpaca:orderbook:<SYM>` with `symbol` + `timestamp` so consumers can
+    show last-update info.
   - Redis HSET cannot accept `None` values. Crypto quotes routinely have
     `bid_exchange`/`ask_exchange` = None. Before every `r.hset(..., mapping=d)`
     call, filter Nones with a `_clean(d)` helper:
@@ -252,35 +268,43 @@ REQUIREMENTS:
       * `LPUSH alpaca:recent:<SYMBOL>:<KIND> <json>` then `LTRIM ... 0 99`
         where KIND is `trade` or `quote`.
       * `SADD alpaca:symbols <SYMBOL>` so the CLI / GUI can list them.
-  - For each incoming ORDERBOOK message, MERGE the levels into per-side
-    Redis HASH keys (one HASH per side per symbol). Alpaca's crypto
-    orderbook websocket delivers DELTAS -- each message has only the
-    changed levels, NOT a full snapshot. Overwriting the whole book on
-    each tick (the obvious wrong implementation) would leave you with
-    just the last delta in Redis. Apply per-level updates instead:
-        BIDS_KEY = f"alpaca:ob:bids:{symbol}"
-        ASKS_KEY = f"alpaca:ob:asks:{symbol}"
-        def _pf(p): return f"{float(p):.10g}"  # canonical price field name
+  - For each incoming ORDERBOOK message, branch on the `reset` flag.
+    Alpaca's crypto orderbook stream is HYBRID: messages with `reset=True`
+    are full server-side snapshots (sent first after subscription and
+    after reconnects); messages with `reset=False` are deltas containing
+    only changed levels. Always-replace truncates depth to whatever shallow
+    update arrived last (one ask, no bids, etc.); always-merge accumulates
+    stale levels forever and crosses the book. Honor the flag:
+        bids_key = f"alpaca:ob:bids:{symbol}"
+        asks_key = f"alpaca:ob:asks:{symbol}"
+        def _pf(p): return f"{float(p):.10g}"
 
-        # for each level in the incoming book.bids:
-        for lv in book.bids:
-            field = _pf(lv.price)
-            size  = float(lv.size)
-            if size > 0:
-                r.hset(BIDS_KEY, field, size)
-            else:
-                r.hdel(BIDS_KEY, field)
-        # ... and the same for book.asks against ASKS_KEY.
+        pipe = r.pipeline()
+        if getattr(book, "reset", False):
+            pipe.delete(bids_key)
+            pipe.delete(asks_key)
+            bid_map = {_pf(lv.price): float(lv.size) for lv in (book.bids or []) if float(lv.size) > 0}
+            ask_map = {_pf(lv.price): float(lv.size) for lv in (book.asks or []) if float(lv.size) > 0}
+            if bid_map: pipe.hset(bids_key, mapping=bid_map)
+            if ask_map: pipe.hset(asks_key, mapping=ask_map)
+        else:
+            for lv in (book.bids or []):
+                f = _pf(lv.price); s = float(lv.size)
+                pipe.hset(bids_key, f, s) if s > 0 else pipe.hdel(bids_key, f)
+            for lv in (book.asks or []):
+                f = _pf(lv.price); s = float(lv.size)
+                pipe.hset(asks_key, f, s) if s > 0 else pipe.hdel(asks_key, f)
+        # ... metadata hset + sadd in the same pipeline ...
+        pipe.execute()
 
-    After applying the deltas, write a small metadata HASH for the GUI:
+    After applying the message, write a small metadata HASH for the GUI:
         r.hset(f"alpaca:orderbook:{symbol}", mapping={
             "symbol":    symbol,
             "timestamp": iso_ts_string,
         })
         r.sadd("alpaca:symbols", symbol)
     DO NOT json-encode bids/asks into the metadata hash; the actual book
-    levels live ONLY in the per-side HASHes. DO NOT clear the per-side
-    HASHes before writing -- that defeats the merge.
+    levels live ONLY in the per-side HASHes.
 
     Note: alpaca-py's Orderbook model carries `.bids` and `.asks` as
     LISTS of items with `.price` and `.size` ATTRIBUTES (not dicts).
@@ -461,6 +485,7 @@ REQUIREMENTS:
           side            TEXT,
           type            TEXT,
           qty             REAL,
+          limit_price     REAL,                -- NULL for market orders
           filled_qty      REAL,
           filled_avg_price REAL,
           status          TEXT,
@@ -469,6 +494,10 @@ REQUIREMENTS:
           created_at      TEXT,
           raw_json        TEXT
         )
+    After CREATE, run a migration to add `limit_price` to pre-existing DBs:
+        cols = {row[1] for row in cursor.execute("PRAGMA table_info(orders)").fetchall()}
+        if "limit_price" not in cols:
+            cursor.execute("ALTER TABLE orders ADD COLUMN limit_price REAL")
         fills(
           id              INTEGER PRIMARY KEY AUTOINCREMENT,
           execution_id    TEXT UNIQUE,         -- payload['execution_id']; UNIQUE for idempotence
@@ -522,12 +551,16 @@ REQUIREMENTS:
       1. Always INSERT into `trade_events(event, order_id, ts, raw_json)`
          with raw_json = json.dumps(payload, default=str).
       2. Upsert the order (use values from the nested `order` dict, falling
-         back to top-level fields where order is empty):
+         back to top-level fields where order is empty). Pull `limit_price`
+         out of the nested order dict (None for market orders); use COALESCE
+         on update so a later partial-fill event lacking the field doesn't
+         clobber the original limit price:
            INSERT INTO orders(order_id, client_order_id, symbol, side, type,
-             qty, filled_qty, filled_avg_price, status,
+             qty, limit_price, filled_qty, filled_avg_price, status,
              submitted_at, updated_at, created_at, raw_json)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(order_id) DO UPDATE SET
+             limit_price=COALESCE(excluded.limit_price, orders.limit_price),
              filled_qty=excluded.filled_qty,
              filled_avg_price=excluded.filled_avg_price,
              status=excluded.status,
@@ -751,11 +784,12 @@ LAYOUT:
       filled / canceled). No auto-poll (this changes slowly).
     - Orders table: GET /api/orders?limit=50[&status=...]. Columns IN
       ORDER: submitted_at, order_id (truncate to 8 chars; full id in
-      `title` attribute), symbol, side, type, qty, filled_qty,
-      `Avg Px ($)` (filled_avg_price), `Notional ($)` (filled_avg_price
-      * filled_qty, blank if either is null), status, action. For active
-      statuses (new/accepted/pending_new/partially_filled), include a
-      "cancel" button that DELETEs /api/order/<id>.
+      `title` attribute), symbol, side, type, `Limit ($)` (limit_price,
+      blank for market orders), qty, filled_qty, `Avg Px ($)`
+      (filled_avg_price), `Notional ($)` (filled_avg_price * filled_qty,
+      blank if either is null), status, action. For active statuses
+      (new/accepted/pending_new/partially_filled), include a "cancel"
+      button that DELETEs /api/order/<id>.
     - Fills table below it: GET /api/fills?limit=50. Columns IN ORDER:
       ts, order_id (truncated), symbol, side, qty, `Price ($)` (price),
       `Notional ($)` (price * qty), event.

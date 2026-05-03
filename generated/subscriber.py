@@ -92,37 +92,48 @@ async def main():
         r.sadd("alpaca:symbols", symbol)
 
     async def orderbook_handler(orderbook):
-        # Alpaca's crypto orderbook websocket delivers DELTAS, not full
-        # snapshots: each message contains only the levels that changed.
-        # Merge into per-side HASHes (HSET on size>0, HDEL on size==0)
-        # so the accumulated book lives in Redis. NEVER overwrite the
-        # whole book or you lose all but the most recent delta.
+        # Alpaca's crypto orderbook stream is hybrid: messages with
+        # `reset=True` are full server-side snapshots (typically the first
+        # message after subscription and after reconnects); subsequent
+        # messages are deltas containing only changed levels (size>0 =
+        # upsert, size==0 = remove). Honor the flag — without it we
+        # either lose depth (always-replace) or accumulate stale levels
+        # forever (always-merge) and the book crosses.
         symbol = orderbook.symbol
         timestamp_iso = orderbook.timestamp.isoformat() if orderbook.timestamp else None
 
         bids_key = f"alpaca:ob:bids:{symbol}"
         asks_key = f"alpaca:ob:asks:{symbol}"
 
-        def _pf(p):  # canonical price field-name so updates land idempotently
+        def _pf(p):
             return f"{float(p):.10g}"
 
         pipe = r.pipeline()
-        for lv in (orderbook.bids or []):
-            field = _pf(lv.price)
-            size = float(lv.size)
-            if size > 0:
-                pipe.hset(bids_key, field, size)
-            else:
-                pipe.hdel(bids_key, field)
-        for lv in (orderbook.asks or []):
-            field = _pf(lv.price)
-            size = float(lv.size)
-            if size > 0:
-                pipe.hset(asks_key, field, size)
-            else:
-                pipe.hdel(asks_key, field)
+        if getattr(orderbook, "reset", False):
+            pipe.delete(bids_key)
+            pipe.delete(asks_key)
+            bid_map = {_pf(lv.price): float(lv.size) for lv in (orderbook.bids or []) if float(lv.size) > 0}
+            ask_map = {_pf(lv.price): float(lv.size) for lv in (orderbook.asks or []) if float(lv.size) > 0}
+            if bid_map:
+                pipe.hset(bids_key, mapping=bid_map)
+            if ask_map:
+                pipe.hset(asks_key, mapping=ask_map)
+        else:
+            for lv in (orderbook.bids or []):
+                field = _pf(lv.price)
+                size = float(lv.size)
+                if size > 0:
+                    pipe.hset(bids_key, field, size)
+                else:
+                    pipe.hdel(bids_key, field)
+            for lv in (orderbook.asks or []):
+                field = _pf(lv.price)
+                size = float(lv.size)
+                if size > 0:
+                    pipe.hset(asks_key, field, size)
+                else:
+                    pipe.hdel(asks_key, field)
 
-        # Metadata hash (book itself lives in the per-side hashes above).
         meta = _clean({"symbol": symbol, "timestamp": timestamp_iso})
         if meta:
             pipe.hset(f"alpaca:orderbook:{symbol}", mapping=meta)

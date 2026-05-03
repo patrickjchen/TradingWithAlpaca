@@ -75,7 +75,7 @@ For crypto symbols use `TimeInForce.GTC` (or `IOC`) — `DAY` is rejected. Use `
 | `alpaca:trade_updates`           | Stream | trade_stream.py   | persister.py        |
 | `alpaca:recent:trade_updates`    | List   | trade_stream.py   | (debug only)        |
 
-`alpaca:orderbook:<SYM>` HASH holds metadata only: `symbol`, `timestamp`. The actual L2 book lives in `alpaca:ob:bids:<SYM>` and `alpaca:ob:asks:<SYM>`, each a HASH of `<canonical price str> -> <size str>`. Subscriber **merges** deltas (Alpaca's crypto orderbook websocket delivers level changes, NOT full snapshots): `size > 0` → HSET that level, `size == 0` → HDEL that level. Webgui's `/api/orderbook` HGETALLs both sides, sorts (bids DESC by price, asks ASC), and slices to the top 10 per side.
+`alpaca:orderbook:<SYM>` HASH holds metadata only: `symbol`, `timestamp`. The actual L2 book lives in `alpaca:ob:bids:<SYM>` and `alpaca:ob:asks:<SYM>`, each a HASH of `<canonical price str> -> <size str>`. Alpaca's crypto orderbook stream is **hybrid**: `Orderbook.reset=True` messages are full server-side snapshots (typically the first after subscription / reconnects); `reset=False` messages are deltas with only the levels that changed (size>0 → upsert, size==0 → remove). Subscriber must honor the flag — on reset, DEL each side then HSET the snapshot; on delta, HSET/HDEL per level. Always-replace would truncate depth to the last shallow update; always-merge would accumulate stale levels forever and cross the book. Webgui's `/api/orderbook` HGETALLs both sides, sorts (bids DESC by price, asks ASC), and slices to the top 10 per side.
 
 Persister consumer group defaults: group `persister`, consumer `persister-1`. Override via `$PERSISTER_GROUP` / `$PERSISTER_CONSUMER`.
 
