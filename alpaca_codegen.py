@@ -749,13 +749,19 @@ LAYOUT:
   Tab 2: "Activity" -- recent orders + fills from SQLite.
     - Manual Refresh button + a Status filter <select> (all / open /
       filled / canceled). No auto-poll (this changes slowly).
-    - Orders table: GET /api/orders?limit=50[&status=...]. Columns:
-      submitted_at, symbol, side, type, qty, filled_qty, status,
-      order_id (truncate to 8 chars; full id in `title` attribute).
-      For active statuses (new/accepted/pending_new/partially_filled),
-      include a "cancel" button that DELETEs /api/order/<id>.
-    - Fills table below it: GET /api/fills?limit=50. Columns: ts,
-      order_id (truncated), symbol, side, qty, price, event.
+    - Orders table: GET /api/orders?limit=50[&status=...]. Columns IN
+      ORDER: submitted_at, order_id (truncate to 8 chars; full id in
+      `title` attribute), symbol, side, type, qty, filled_qty,
+      `Avg Px ($)` (filled_avg_price), `Notional ($)` (filled_avg_price
+      * filled_qty, blank if either is null), status, action. For active
+      statuses (new/accepted/pending_new/partially_filled), include a
+      "cancel" button that DELETEs /api/order/<id>.
+    - Fills table below it: GET /api/fills?limit=50. Columns IN ORDER:
+      ts, order_id (truncated), symbol, side, qty, `Price ($)` (price),
+      `Notional ($)` (price * qty), event.
+    - Both Avg Px and Price columns format to 2 decimals; Notional
+      formats to 2 decimals. Show empty cells when values are null --
+      never render "NaN" or "undefined".
 
   Tab 3: "Summary" -- account + positions + realized PnL.
     - Live toggle (checkbox, default OFF=paper). Manual Refresh button.

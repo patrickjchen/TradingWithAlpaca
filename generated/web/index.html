@@ -144,13 +144,13 @@
     
     <h3>Orders</h3>
     <table>
-        <thead><tr><th>Time</th><th>ID</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Filled</th><th>Status</th><th>Action</th></tr></thead>
+        <thead><tr><th>Time</th><th>ID</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Filled</th><th>Avg Px ($)</th><th>Notional ($)</th><th>Status</th><th>Action</th></tr></thead>
         <tbody id="orders-tbody"></tbody>
     </table>
 
     <h3>Fills</h3>
     <table>
-        <thead><tr><th>Time</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Event</th></tr></thead>
+        <thead><tr><th>Time</th><th>Order ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price ($)</th><th>Notional ($)</th><th>Event</th></tr></thead>
         <tbody id="fills-tbody"></tbody>
     </table>
 </div>
@@ -404,7 +404,7 @@
         const tbody = document.getElementById('orders-tbody');
         tbody.innerHTML = '';
         if (!orders || orders.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="9" style="text-align:center">(no rows)</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="11" style="text-align:center">(no rows)</td></tr>';
             return;
         }
         const activeStatuses = ['new', 'accepted', 'pending_new', 'partially_filled'];
@@ -416,6 +416,9 @@
             if (activeStatuses.includes(o.status)) {
                 actionHtml = `<button onclick="cancelOrder('${o.order_id}', ${isLive})">Cancel</button>`;
             }
+            const avgPx = (o.filled_avg_price != null) ? parseFloat(o.filled_avg_price) : null;
+            const filledQty = (o.filled_qty != null) ? parseFloat(o.filled_qty) : null;
+            const notional = (avgPx != null && filledQty != null) ? avgPx * filledQty : null;
             tr.innerHTML = `
                 <td>${o.submitted_at || ''}</td>
                 <td title="${o.order_id}">${shortId}</td>
@@ -424,6 +427,8 @@
                 <td>${o.type || ''}</td>
                 <td>${formatNum(o.qty, 4)}</td>
                 <td>${formatNum(o.filled_qty, 4)}</td>
+                <td>${avgPx != null ? formatNum(avgPx, 2) : ''}</td>
+                <td>${notional != null ? formatNum(notional, 2) : ''}</td>
                 <td>${o.status || ''}</td>
                 <td>${actionHtml}</td>
             `;
@@ -435,19 +440,23 @@
         const tbody = document.getElementById('fills-tbody');
         tbody.innerHTML = '';
         if (!fills || fills.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center">(no rows)</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center">(no rows)</td></tr>';
             return;
         }
         fills.forEach(f => {
             const tr = document.createElement('tr');
             const shortId = (f.order_id || '').substring(0, 8);
+            const px = (f.price != null) ? parseFloat(f.price) : null;
+            const qty = (f.qty != null) ? parseFloat(f.qty) : null;
+            const notional = (px != null && qty != null) ? px * qty : null;
             tr.innerHTML = `
                 <td>${f.ts || ''}</td>
                 <td title="${f.order_id}">${shortId}</td>
                 <td>${f.symbol || ''}</td>
                 <td>${f.side || ''}</td>
                 <td>${formatNum(f.qty, 4)}</td>
-                <td>${formatNum(f.price, 2)}</td>
+                <td>${px != null ? formatNum(px, 2) : ''}</td>
+                <td>${notional != null ? formatNum(notional, 2) : ''}</td>
                 <td>${f.event || ''}</td>
             `;
             tbody.appendChild(tr);
