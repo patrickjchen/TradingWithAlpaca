@@ -48,6 +48,7 @@ Three tabs:
 
 ## More
 
+- `slides.html` — project overview deck (open in any browser).
 - `DESIGN.md` — agents, stages, sequence + use-case diagrams.
 - `CLAUDE.md` — repo conventions, when to edit a file directly vs.
   re-run the codegen.
